@@ -1,0 +1,57 @@
+# Dockerfile.worker — Multi-stage build for the IncidentBench worker.
+# The worker binary handles both ingest and query modes via --mode flag.
+# Produces a minimal image with dynamically-linked glibc binary.
+
+# ---------- Builder stage ----------
+FROM rust:1.92-bookworm AS builder
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y \
+    protobuf-compiler \
+    libprotobuf-dev \
+    pkg-config \
+    cmake \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+# Copy workspace manifests first for layer caching
+COPY Cargo.toml Cargo.lock* ./
+COPY crates/incidentbench-common/Cargo.toml crates/incidentbench-common/Cargo.toml
+COPY crates/incidentbench-operator/Cargo.toml crates/incidentbench-operator/Cargo.toml
+COPY crates/incidentbench-worker/Cargo.toml crates/incidentbench-worker/Cargo.toml
+COPY crates/incidentbench-reporter/Cargo.toml crates/incidentbench-reporter/Cargo.toml
+COPY crates/incidentbench-cli/Cargo.toml crates/incidentbench-cli/Cargo.toml
+
+# Create dummy source files to pre-build dependencies
+RUN mkdir -p crates/incidentbench-common/src && echo "pub const VERSION: &str = \"0.1.0\";" > crates/incidentbench-common/src/lib.rs \
+    && mkdir -p crates/incidentbench-operator/src && echo "fn main() {}" > crates/incidentbench-operator/src/main.rs \
+    && mkdir -p crates/incidentbench-worker/src && echo "fn main() {}" > crates/incidentbench-worker/src/main.rs \
+    && mkdir -p crates/incidentbench-reporter/src && echo "fn main() {}" > crates/incidentbench-reporter/src/main.rs \
+    && mkdir -p crates/incidentbench-cli/src && echo "fn main() {}" > crates/incidentbench-cli/src/main.rs
+
+# Pre-build dependencies (cached unless Cargo.toml changes)
+RUN cargo build --release -p incidentbench-worker 2>/dev/null || true
+
+# Copy the full workspace source
+COPY proto/ proto/
+COPY crates/ crates/
+
+# Touch source files to invalidate the dummy builds
+RUN find crates -name "*.rs" -exec touch {} +
+
+# Build the worker binary
+RUN cargo build --release -p incidentbench-worker
+
+# ---------- Runtime stage ----------
+FROM debian:bookworm-slim AS runtime
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /build/target/release/incidentbench-worker /usr/local/bin/incidentbench-worker
+
+USER nobody
+
+ENTRYPOINT ["/usr/local/bin/incidentbench-worker"]

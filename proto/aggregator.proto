@@ -1,0 +1,113 @@
+// Copyright 2025 Mach5 Software, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+syntax = "proto3";
+
+package incidentbench.aggregator;
+
+import "worker.proto";
+
+// The MetricsService receives snapshots from workers and serves
+// live metrics to CLI subscribers.
+service MetricsService {
+  // Workers stream their per-second metric snapshots.
+  rpc ReportMetrics(stream incidentbench.worker.WorkerMetricSnapshot) returns (ReportMetricsResponse);
+
+  // CLI or other subscribers receive aggregated 1-second snapshots.
+  rpc StreamMetrics(StreamMetricsRequest) returns (stream AggregatedSnapshot);
+
+  // One-shot: get the current aggregation status.
+  rpc GetAggregationStatus(AggregationStatusRequest) returns (AggregationStatusResponse);
+
+  // Get the latest aggregated snapshot (for live progress reporting).
+  rpc GetLatestSnapshot(GetLatestSnapshotRequest) returns (AggregatedSnapshot);
+
+  // Get computed benchmark results (scorecard + validity).
+  // Only valid after aggregation state is "complete".
+  rpc GetResults(GetResultsRequest) returns (GetResultsResponse);
+}
+
+message ReportMetricsResponse {}
+
+message StreamMetricsRequest {
+  // If true, stream historical snapshots first, then live.
+  bool include_history = 1;
+}
+
+// Aggregated 1-second snapshot across all workers.
+message AggregatedSnapshot {
+  int64 timestamp_ns = 1;
+  string phase = 2;
+
+  // Ingest metrics (aggregated across all ingest workers).
+  int64 ingest_events_produced = 10;
+  int64 ingest_events_acknowledged = 11;
+  int64 ingest_events_failed = 12;
+  int64 ingest_target_eps = 13;
+  PercentileSummary ingest_kafka_produce_latency = 14;
+
+  // Query metrics (aggregated across all query workers).
+  int64 query_executed = 20;
+  int64 query_errors = 21;
+  double query_target_qps = 22;
+  PercentileSummary query_latency = 23;
+
+  // Kafka consumer lag (read from Kafka admin API).
+  int64 kafka_consumer_lag = 30;
+
+  // Worker counts.
+  int32 ingest_workers_reporting = 40;
+  int32 query_workers_reporting = 41;
+
+  // Harness health.
+  bool harness_saturated = 50;
+  double max_worker_cpu = 51;
+}
+
+// Pre-computed percentile summary for display.
+message PercentileSummary {
+  double p50 = 1;
+  double p95 = 2;
+  double p99 = 3;
+  double max = 4;
+  int64 count = 5;
+}
+
+message AggregationStatusRequest {}
+
+message AggregationStatusResponse {
+  string state = 1;  // "collecting" | "aggregating" | "complete"
+  int64 snapshots_received = 2;
+  int64 seconds_aggregated = 3;
+  int32 connected_workers = 4;
+}
+
+message GetLatestSnapshotRequest {}
+
+message GetResultsRequest {}
+
+message GetResultsResponse {
+  bool valid = 1;
+  repeated string validity_violations = 2;
+  repeated string warnings = 3;
+  bool harness_saturated = 4;
+  // Scorecard fields
+  double baseline_p99_ms = 10;
+  double overlap_p99_ms = 11;
+  double p99_degradation_ratio = 12;
+  double query_error_rate_overlap = 13;
+  uint64 peak_backlog = 14;
+  double backlog_drain_time_s = 15;
+  double recovery_time_s = 16;
+}

@@ -1,0 +1,397 @@
+---
+apiVersion: incidentbench.io/v1alpha1
+kind: IncidentBenchRun
+metadata:
+  name: sre-outage-run-001
+  namespace: incidentbench-system
+spec:
+  # Scenario — inline reference to the SRE-Outage scenario.
+  # The full scenario definition lives in scenarios/sre-outage/scenario.yaml
+  # and can also be loaded via scenarioRef from a ConfigMap.
+  scenario:
+    scenario:
+      name: "sre-outage"
+      version: "1.0.0"
+      display_name: "SRE Outage"
+      description: >
+        A deployment introduces a bug in a core microservice. Error rates spike.
+        The service begins emitting 10-50x its normal log volume as retries cascade
+        and stack traces fill the logs. The logging platform must simultaneously absorb
+        the ingestion surge and serve investigative queries without degradation.
+      domain: "sre"
+
+    data_streams:
+      - name: "sre-outage-logs"
+        schema:
+          index_name: "incidentbench-sre-outage"
+          timestamp_field: "@timestamp"
+          fields:
+            - name: "@timestamp"
+              type: timestamp
+              generator: now
+
+            - name: "level"
+              type: keyword
+              generator: weighted_enum
+              config:
+                baseline:
+                  INFO: 0.70
+                  WARN: 0.15
+                  ERROR: 0.10
+                  DEBUG: 0.05
+                incident:
+                  ERROR: 0.60
+                  WARN: 0.20
+                  INFO: 0.10
+                  DEBUG: 0.10
+
+            - name: "service"
+              type: keyword
+              generator: weighted_enum
+              config:
+                values:
+                  api-gateway: 0.15
+                  user-service: 0.10
+                  payment-service: 0.25
+                  order-service: 0.20
+                  inventory-service: 0.10
+                  notification-service: 0.05
+                  auth-service: 0.10
+                  search-service: 0.05
+
+            - name: "host"
+              type: keyword
+              generator: pattern
+              config:
+                pattern: "{service}-{pod_id}.internal"
+                pod_id:
+                  type: range
+                  min: 1
+                  max: 20
+
+            - name: "trace_id"
+              type: keyword
+              generator: hex
+              config:
+                length: 32
+
+            - name: "span_id"
+              type: keyword
+              generator: hex
+              config:
+                length: 16
+
+            - name: "http_status"
+              type: int
+              generator: weighted_enum
+              config:
+                baseline:
+                  200: 0.85
+                  201: 0.05
+                  400: 0.03
+                  404: 0.02
+                  500: 0.03
+                  502: 0.01
+                  503: 0.01
+                incident:
+                  200: 0.30
+                  201: 0.02
+                  400: 0.05
+                  404: 0.03
+                  500: 0.35
+                  502: 0.15
+                  503: 0.10
+
+            - name: "response_time_ms"
+              type: int
+              generator: distribution
+              config:
+                baseline:
+                  type: lognormal
+                  mean: 50
+                  stddev: 30
+                  min: 1
+                  max: 2000
+                incident:
+                  type: lognormal
+                  mean: 500
+                  stddev: 400
+                  min: 1
+                  max: 30000
+
+            - name: "message"
+              type: text
+              generator: template
+              config:
+                templates:
+                  INFO:
+                    - "Request processed successfully"
+                    - "Connection established to {service}"
+                    - "Cache hit for key {trace_id}"
+                    - "Health check passed"
+                  WARN:
+                    - "Slow response from {service}: {response_time_ms}ms"
+                    - "Retry attempt {retry_count} for {service}"
+                    - "Connection pool nearing capacity: {pool_pct}%"
+                    - "Rate limit approaching for client {client_id}"
+                  ERROR:
+                    - "Connection refused by {service} on {host}"
+                    - "Timeout after {response_time_ms}ms calling {service}"
+                    - "NullPointerException in PaymentProcessor.processOrder(PaymentProcessor.java:{line})"
+                    - "Circuit breaker OPEN for {service}"
+                    - "Database connection failed: max retries exceeded"
+                    - "Failed to deserialize response from {service}: unexpected EOF"
+                  DEBUG:
+                    - "Entering {method} with args: {args_summary}"
+                    - "SQL query executed in {query_time}ms"
+
+            - name: "error_code"
+              type: keyword
+              generator: conditional
+              config:
+                condition: "level in [ERROR, WARN]"
+                generator: weighted_enum
+                values:
+                  CONN_REFUSED: 0.25
+                  TIMEOUT: 0.30
+                  NULL_PTR: 0.15
+                  CIRCUIT_OPEN: 0.10
+                  DB_CONN_FAIL: 0.10
+                  DESER_FAIL: 0.10
+                else: null
+
+            - name: "duration_ns"
+              type: long
+              generator: derived
+              config:
+                expression: "response_time_ms * 1000000"
+
+            - name: "kubernetes.namespace"
+              type: keyword
+              generator: enum
+              config:
+                values: ["production", "production"]
+
+            - name: "kubernetes.pod_name"
+              type: keyword
+              generator: derived
+              config:
+                expression: "host"
+
+            - name: "kubernetes.container_name"
+              type: keyword
+              generator: derived
+              config:
+                expression: "service"
+
+        data_generator:
+          type: "template"
+          config:
+            seed: 42
+        kafka_partitions: 2
+        ingest_replicas: 2
+        ingest:
+          baseline:         { target_eps: 5000, batch_size: 500 }
+          incident_trigger: { target_eps: 15000, batch_size: 500 }
+          ingestion_surge:  { target_eps: 50000, batch_size: 1000 }
+          overlap:          { target_eps: 50000, batch_size: 1000 }
+          recovery:         { target_eps: 10000, batch_size: 500 }
+          post_incident:    { target_eps: 5000, batch_size: 500 }
+
+    query_mix:
+      queries:
+        - name: "error_search"
+          type: search
+          weight: 0.25
+          template: "level:ERROR AND service:payment-service"
+          index: "incidentbench-sre-outage"
+          timeout_ms: 10000
+          description: "Search for errors in the failing service"
+
+        - name: "recent_errors"
+          type: search
+          weight: 0.15
+          template: "level:ERROR"
+          sort: "@timestamp:desc"
+          limit: 100
+          index: "incidentbench-sre-outage"
+          timeout_ms: 10000
+          description: "Most recent errors across all services"
+
+        - name: "error_code_agg"
+          type: aggregation
+          weight: 0.15
+          template: |
+            filter: level:ERROR
+            aggregate: terms(error_code)
+          index: "incidentbench-sre-outage"
+          timeout_ms: 15000
+          description: "Top error codes"
+
+        - name: "service_error_rate"
+          type: aggregation
+          weight: 0.15
+          template: |
+            filter: *
+            aggregate: terms(service) > terms(level)
+          index: "incidentbench-sre-outage"
+          timeout_ms: 15000
+          description: "Error rate breakdown by service"
+
+        - name: "trace_lookup"
+          type: search
+          weight: 0.10
+          template: "trace_id:{{random_trace_id}}"
+          index: "incidentbench-sre-outage"
+          timeout_ms: 10000
+          description: "Look up a specific trace"
+          variables:
+            random_trace_id:
+              source: "recently_ingested"
+
+        - name: "status_code_timeline"
+          type: aggregation
+          weight: 0.10
+          template: |
+            filter: service:payment-service
+            aggregate: date_histogram(@timestamp, interval=1m) > terms(http_status)
+          index: "incidentbench-sre-outage"
+          timeout_ms: 20000
+          description: "HTTP status code trend for failing service"
+
+        - name: "slow_requests"
+          type: search
+          weight: 0.05
+          template: "response_time_ms:>5000 AND service:payment-service"
+          index: "incidentbench-sre-outage"
+          timeout_ms: 10000
+          description: "Find slow requests in the failing service"
+
+        - name: "wildcard_message"
+          type: search
+          weight: 0.05
+          template: "message:*NullPointerException*"
+          index: "incidentbench-sre-outage"
+          timeout_ms: 15000
+          description: "Wildcard search for specific exception"
+
+    # Optional: query groups for multi-analyst benchmarking.
+    # When present, each group gets a proportion of total QPS and can override
+    # the query mix to simulate different analyst personas.
+    # query_groups:
+    #   - name: "heavy-analysts"
+    #     weight: 0.4
+    #     mix_override:
+    #       error_code_agg: 0.3
+    #       service_error_rate: 0.4
+    #       status_code_timeline: 0.3
+    #   - name: "light-analysts"
+    #     weight: 0.6
+    #     mix_override:
+    #       error_search: 0.4
+    #       recent_errors: 0.3
+    #       trace_lookup: 0.2
+    #       slow_requests: 0.1
+
+    timeline:
+      phases:
+        - name: "baseline"
+          display_name: "Baseline"
+          duration_seconds: 120
+          query:
+            target_qps: 5.0
+          description: >
+            Normal operating conditions. Moderate log volume.
+            Engineers are not actively investigating.
+
+        - name: "incident_trigger"
+          display_name: "Incident Trigger"
+          duration_seconds: 60
+          query:
+            target_qps: 5.0
+          description: >
+            Bug deployed. Error rates spike. Log volume triples.
+            No human response yet — alerting hasn't fired.
+
+        - name: "ingestion_surge"
+          display_name: "Ingestion Surge"
+          duration_seconds: 90
+          query:
+            target_qps: 15.0
+          description: >
+            Cascade in effect. Retries multiply log volume to 10x.
+            Alert fires. On-call begins querying.
+
+        - name: "overlap"
+          display_name: "Overlap"
+          duration_seconds: 120
+          query:
+            target_qps: 40.0
+          description: >
+            Full incident mode. Ingestion at peak.
+            Multiple engineers querying simultaneously.
+            This is the core measurement window.
+
+        - name: "recovery"
+          display_name: "Recovery"
+          duration_seconds: 90
+          query:
+            target_qps: 20.0
+          description: >
+            Fix deployed. Error rates declining.
+            Engineers still querying to verify fix.
+
+        - name: "post_incident"
+          display_name: "Post-Incident"
+          duration_seconds: 120
+          query:
+            target_qps: 5.0
+          description: >
+            Incident resolved. Rates return to baseline.
+            Measuring whether the system fully recovers.
+
+    valid_run_criteria:
+      rules:
+        - name: "baseline_query_stability"
+          condition: "query.baseline_p99 < 5000"
+          message: "Baseline p99 must be under 5s — if it's higher, the system is too slow or misconfigured for this scenario."
+
+    report:
+      title: "IncidentBench SRE-Outage Report"
+      emphasis:
+        - "p99_degradation_ratio"
+        - "backlog_drain_time"
+        - "recovery_time"
+
+  images:
+    worker: "10.1.1.210:32000/incidentbench/worker:v0.1.0"
+    reporter: "10.1.1.210:32000/incidentbench/reporter:v0.1.0"
+
+  # Target platform configuration
+  target:
+    adapter: "mach5"
+    config:
+      endpoint: "http://mach5-nginx.mach5.svc"
+      namespace: "incidentbench-sre-outage"
+      warehouse:
+        name: "incidentbench-sre-wh"
+        numMediators: 1
+        numOs: 1
+
+  # Kafka configuration
+  kafka:
+    bootstrap_servers: "kafka-bootstrap.kafka.svc.cluster.local:9092"
+
+  # Scaling — durationScale 12x stretches 10min scenario to 2 hours
+  scaling:
+    duration_scale: 18.0
+    rate_scale: 0.1
+
+  # Worker configuration
+  workers:
+    ingest:
+      replicas: 2
+    query:
+      replicas: 1
+
+  dry_run: false

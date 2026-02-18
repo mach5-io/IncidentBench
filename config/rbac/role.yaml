@@ -1,0 +1,81 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: incidentbench-operator
+  labels:
+    app.kubernetes.io/name: incidentbench-operator
+    app.kubernetes.io/part-of: incidentbench
+rules:
+  # IncidentBenchRun CRD — full control
+  - apiGroups: ["incidentbench.io"]
+    resources: ["incidentbenchruns"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["incidentbench.io"]
+    resources: ["incidentbenchruns/status"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: ["incidentbench.io"]
+    resources: ["incidentbenchruns/finalizers"]
+    verbs: ["update"]
+
+  # Deployments — worker and phase controller management
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+  # StatefulSets — MetricsAggregator and managed Kafka
+  - apiGroups: ["apps"]
+    resources: ["statefulsets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+  # Jobs — init job and report-generator job
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+  # ConfigMaps — scenario config and worker rate tables
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+  # Secrets — target platform credentials
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "watch"]
+
+  # Services — expose PhaseController and MetricsAggregator gRPC
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+  # Pods — worker lifecycle inspection
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+
+  # Pod logs — debugging failed workers
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get", "list"]
+
+  # Events — emit Kubernetes events for operator lifecycle transitions
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["get", "list", "watch", "create", "patch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: incidentbench-operator
+  labels:
+    app.kubernetes.io/name: incidentbench-operator
+    app.kubernetes.io/part-of: incidentbench
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: incidentbench-operator
+subjects:
+  - kind: ServiceAccount
+    name: incidentbench-operator
+    namespace: incidentbench-system

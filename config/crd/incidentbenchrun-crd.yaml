@@ -1,0 +1,747 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: incidentbenchruns.incidentbench.io
+spec:
+  group: incidentbench.io
+  names:
+    categories: []
+    kind: IncidentBenchRun
+    plural: incidentbenchruns
+    shortNames:
+    - ibrun
+    singular: incidentbenchrun
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns: []
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for IncidentBenchRunSpec via `CustomResource`
+        properties:
+          spec:
+            description: IncidentBenchRun CRD spec.
+            properties:
+              dry_run:
+                default: false
+                description: Dry-run mode — validate and print execution plan without running.
+                type: boolean
+              images:
+                description: Container image overrides.
+                nullable: true
+                properties:
+                  operator:
+                    nullable: true
+                    type: string
+                  reporter:
+                    nullable: true
+                    type: string
+                  worker:
+                    nullable: true
+                    type: string
+                type: object
+              kafka:
+                description: Kafka configuration.
+                properties:
+                  bootstrap_servers:
+                    description: Bootstrap servers for an external Kafka cluster.
+                    nullable: true
+                    type: string
+                  managed:
+                    default: false
+                    description: Let the operator deploy a managed Kafka cluster.
+                    type: boolean
+                  managed_config:
+                    description: Configuration for managed Kafka.
+                    nullable: true
+                    properties:
+                      replicas:
+                        default: 3
+                        format: uint32
+                        minimum: 0.0
+                        type: integer
+                      storage:
+                        default: 10Gi
+                        type: string
+                    type: object
+                type: object
+              results:
+                default:
+                  storage:
+                    pvc: null
+                    s3: null
+                    storage_type: pvc
+                description: Results storage configuration.
+                properties:
+                  storage:
+                    default:
+                      pvc: null
+                      s3: null
+                      storage_type: pvc
+                    properties:
+                      pvc:
+                        nullable: true
+                        properties:
+                          claim_name:
+                            type: string
+                          sub_path:
+                            default: runs/
+                            type: string
+                        required:
+                        - claim_name
+                        type: object
+                      s3:
+                        nullable: true
+                        properties:
+                          bucket:
+                            type: string
+                          endpoint:
+                            nullable: true
+                            type: string
+                          prefix:
+                            type: string
+                          region:
+                            nullable: true
+                            type: string
+                        required:
+                        - bucket
+                        - prefix
+                        type: object
+                      storage_type:
+                        default: pvc
+                        type: string
+                    type: object
+                type: object
+              scaling:
+                default:
+                  duration_scale: 1.0
+                  rate_scale: 1.0
+                description: Scaling factors.
+                properties:
+                  duration_scale:
+                    default: 1.0
+                    format: double
+                    type: number
+                  rate_scale:
+                    default: 1.0
+                    format: double
+                    type: number
+                type: object
+              scenario:
+                description: Inline scenario definition.
+                nullable: true
+                properties:
+                  data_streams:
+                    description: Data streams — each stream maps to one index, one Kafka topic, and one ingest pipeline.
+                    items:
+                      description: 'A single data stream: one index, one Kafka topic, one ingest pipeline.'
+                      properties:
+                        data_generator:
+                          description: Data generator configuration for producing events.
+                          properties:
+                            config:
+                              type: object
+                              x-kubernetes-preserve-unknown-fields: true
+                            type:
+                              type: string
+                          required:
+                          - type
+                          type: object
+                        ingest:
+                          additionalProperties:
+                            description: Ingest rate configuration for a single phase within a data stream.
+                            properties:
+                              batch_size:
+                                default: 500
+                                description: Kafka batch size. Defaults to 500.
+                                format: uint32
+                                minimum: 0.0
+                                type: integer
+                              target_eps:
+                                description: Total events per second for this stream in this phase (divided across ingest_replicas).
+                                format: uint64
+                                minimum: 0.0
+                                type: integer
+                            required:
+                            - target_eps
+                            type: object
+                          description: Per-phase ingest rates for this stream. Keys are phase names from the timeline. Total EPS is divided across ingest_replicas workers.
+                          type: object
+                        ingest_replicas:
+                          description: Number of ingest worker pods for this stream. Total EPS is divided across replicas.
+                          format: uint32
+                          minimum: 0.0
+                          type: integer
+                        kafka_partitions:
+                          description: Number of Kafka partitions for this stream's topic. Defaults to ingest_replicas.
+                          format: uint32
+                          minimum: 0.0
+                          nullable: true
+                          type: integer
+                        name:
+                          description: Stream identifier (used in deployment names, configmap keys).
+                          type: string
+                        schema:
+                          description: Index schema for this stream.
+                          properties:
+                            fields:
+                              items:
+                                properties:
+                                  config:
+                                    type: object
+                                    x-kubernetes-preserve-unknown-fields: true
+                                  generator:
+                                    type: string
+                                  name:
+                                    type: string
+                                  type:
+                                    enum:
+                                    - timestamp
+                                    - keyword
+                                    - text
+                                    - int
+                                    - long
+                                    - float
+                                    - ip
+                                    type: string
+                                required:
+                                - generator
+                                - name
+                                - type
+                                type: object
+                              type: array
+                            index_name:
+                              type: string
+                            timestamp_field:
+                              type: string
+                          required:
+                          - fields
+                          - index_name
+                          - timestamp_field
+                          type: object
+                      required:
+                      - data_generator
+                      - ingest
+                      - ingest_replicas
+                      - name
+                      - schema
+                      type: object
+                    type: array
+                  query_groups:
+                    description: Optional analyst groups with per-group query weight distributions.
+                    items:
+                      description: An analyst group with its own query weight distribution.
+                      properties:
+                        mix_override:
+                          additionalProperties:
+                            format: double
+                            type: number
+                          nullable: true
+                          type: object
+                        name:
+                          type: string
+                        weight:
+                          format: double
+                          type: number
+                      required:
+                      - name
+                      - weight
+                      type: object
+                    nullable: true
+                    type: array
+                  query_mix:
+                    properties:
+                      queries:
+                        items:
+                          properties:
+                            description:
+                              default: ''
+                              type: string
+                            index:
+                              description: Which index this query targets (must match a data_stream's schema.index_name).
+                              type: string
+                            limit:
+                              format: uint32
+                              minimum: 0.0
+                              nullable: true
+                              type: integer
+                            name:
+                              type: string
+                            sort:
+                              nullable: true
+                              type: string
+                            template:
+                              type: string
+                            timeout_ms:
+                              default: 0
+                              format: uint64
+                              minimum: 0.0
+                              type: integer
+                            type:
+                              type: string
+                            variables:
+                              additionalProperties:
+                                properties:
+                                  source:
+                                    type: string
+                                required:
+                                - source
+                                type: object
+                              default: {}
+                              type: object
+                            weight:
+                              format: double
+                              type: number
+                          required:
+                          - index
+                          - name
+                          - template
+                          - type
+                          - weight
+                          type: object
+                        type: array
+                    required:
+                    - queries
+                    type: object
+                  report:
+                    default:
+                      emphasis: []
+                      title: null
+                    properties:
+                      emphasis:
+                        default: []
+                        items:
+                          type: string
+                        type: array
+                      title:
+                        nullable: true
+                        type: string
+                    type: object
+                  scenario:
+                    properties:
+                      description:
+                        default: ''
+                        type: string
+                      display_name:
+                        type: string
+                      domain:
+                        default: ''
+                        type: string
+                      name:
+                        type: string
+                      version:
+                        type: string
+                    required:
+                    - display_name
+                    - name
+                    - version
+                    type: object
+                  timeline:
+                    properties:
+                      phases:
+                        items:
+                          properties:
+                            description:
+                              default: ''
+                              type: string
+                            display_name:
+                              type: string
+                            duration_seconds:
+                              format: uint64
+                              minimum: 0.0
+                              type: integer
+                            name:
+                              type: string
+                            query:
+                              properties:
+                                mix_override:
+                                  additionalProperties:
+                                    format: double
+                                    type: number
+                                  nullable: true
+                                  type: object
+                                target_qps:
+                                  format: double
+                                  type: number
+                              required:
+                              - target_qps
+                              type: object
+                          required:
+                          - display_name
+                          - duration_seconds
+                          - name
+                          - query
+                          type: object
+                        type: array
+                    required:
+                    - phases
+                    type: object
+                  valid_run_criteria:
+                    default:
+                      rules: []
+                    properties:
+                      rules:
+                        default: []
+                        items:
+                          properties:
+                            condition:
+                              type: string
+                            message:
+                              default: ''
+                              type: string
+                            name:
+                              type: string
+                          required:
+                          - condition
+                          - name
+                          type: object
+                        type: array
+                    type: object
+                required:
+                - data_streams
+                - query_mix
+                - scenario
+                - timeline
+                type: object
+              scenario_ref:
+                description: Reference to a ConfigMap containing the scenario YAML.
+                nullable: true
+                properties:
+                  config_map:
+                    properties:
+                      key:
+                        default: scenario.yaml
+                        type: string
+                      name:
+                        type: string
+                    required:
+                    - name
+                    type: object
+                required:
+                - config_map
+                type: object
+              target:
+                description: Target platform configuration.
+                properties:
+                  adapter:
+                    type: string
+                  config:
+                    default: {}
+                    type: object
+                    x-kubernetes-preserve-unknown-fields: true
+                required:
+                - adapter
+                type: object
+              workers:
+                default:
+                  ingest:
+                    replicas: 10
+                    resources: null
+                  query:
+                    replicas: 4
+                    resources: null
+                  queryGroups: null
+                description: Worker configuration.
+                properties:
+                  ingest:
+                    default:
+                      replicas: 10
+                      resources: null
+                    properties:
+                      replicas:
+                        default: 10
+                        format: uint32
+                        minimum: 0.0
+                        type: integer
+                      resources:
+                        nullable: true
+                        properties:
+                          limits:
+                            additionalProperties:
+                              type: string
+                            nullable: true
+                            type: object
+                          requests:
+                            additionalProperties:
+                              type: string
+                            nullable: true
+                            type: object
+                        type: object
+                    type: object
+                  query:
+                    default:
+                      replicas: 10
+                      resources: null
+                    description: Default query worker config (used when `query_groups` is absent).
+                    properties:
+                      replicas:
+                        default: 10
+                        format: uint32
+                        minimum: 0.0
+                        type: integer
+                      resources:
+                        nullable: true
+                        properties:
+                          limits:
+                            additionalProperties:
+                              type: string
+                            nullable: true
+                            type: object
+                          requests:
+                            additionalProperties:
+                              type: string
+                            nullable: true
+                            type: object
+                        type: object
+                    type: object
+                  queryGroups:
+                    description: Multi-warehouse query groups. Each group maps a scenario query group to a warehouse and replica count. When present, `query` is ignored.
+                    items:
+                      description: Maps a scenario query group to a warehouse and replica count.
+                      properties:
+                        name:
+                          description: References a query group name from the scenario's `query_groups`.
+                          type: string
+                        replicas:
+                          default: 4
+                          description: Number of query worker replicas for this group.
+                          format: uint32
+                          minimum: 0.0
+                          type: integer
+                        resources:
+                          description: Resource requests/limits for this group's query workers.
+                          nullable: true
+                          properties:
+                            limits:
+                              additionalProperties:
+                                type: string
+                              nullable: true
+                              type: object
+                            requests:
+                              additionalProperties:
+                                type: string
+                              nullable: true
+                              type: object
+                          type: object
+                        warehouse:
+                          description: Warehouse configuration for this group.
+                          properties:
+                            name:
+                              description: Warehouse name. Multiple groups can share the same warehouse name to test contention, or use different names for isolation testing.
+                              type: string
+                            numMediators:
+                              default: 1
+                              description: Number of mediator (coordinator) nodes.
+                              format: uint32
+                              minimum: 0.0
+                              type: integer
+                            numOs:
+                              default: 2
+                              description: Number of OpenSearch (query execution) nodes.
+                              format: uint32
+                              minimum: 0.0
+                              type: integer
+                          required:
+                          - name
+                          type: object
+                      required:
+                      - name
+                      - warehouse
+                      type: object
+                    nullable: true
+                    type: array
+                type: object
+            required:
+            - kafka
+            - target
+            type: object
+          status:
+            nullable: true
+            properties:
+              completion_time:
+                description: Run completion time.
+                nullable: true
+                type: string
+              conditions:
+                default: []
+                description: Kubernetes-style conditions.
+                items:
+                  properties:
+                    last_transition_time:
+                      nullable: true
+                      type: string
+                    message:
+                      nullable: true
+                      type: string
+                    status:
+                      type: string
+                    type:
+                      type: string
+                  required:
+                  - status
+                  - type
+                  type: object
+                type: array
+              current_benchmark_phase:
+                description: Current benchmark phase name (e.g., "overlap").
+                nullable: true
+                type: string
+              current_benchmark_phase_index:
+                description: Current benchmark phase index (0-based).
+                format: uint32
+                minimum: 0.0
+                nullable: true
+                type: integer
+              phase:
+                default: Pending
+                description: Operator lifecycle phase.
+                enum:
+                - Pending
+                - Preparing
+                - Initializing
+                - Running
+                - Aggregating
+                - Reporting
+                - Completed
+                - Failed
+                type: string
+              progress:
+                description: Progress metrics (updated during Running phase).
+                nullable: true
+                properties:
+                  achieved_ingest_eps:
+                    format: uint64
+                    minimum: 0.0
+                    type: integer
+                  achieved_query_qps:
+                    format: double
+                    type: number
+                  elapsed_seconds:
+                    format: uint64
+                    minimum: 0.0
+                    type: integer
+                  kafka_consumer_lag:
+                    format: uint64
+                    minimum: 0.0
+                    type: integer
+                  target_ingest_eps:
+                    format: uint64
+                    minimum: 0.0
+                    type: integer
+                  target_query_qps:
+                    format: double
+                    type: number
+                  total_seconds:
+                    format: uint64
+                    minimum: 0.0
+                    type: integer
+                required:
+                - achieved_ingest_eps
+                - achieved_query_qps
+                - elapsed_seconds
+                - kafka_consumer_lag
+                - target_ingest_eps
+                - target_query_qps
+                - total_seconds
+                type: object
+              results:
+                description: Final results (populated after completion).
+                nullable: true
+                properties:
+                  harness_saturated:
+                    type: boolean
+                  scorecard:
+                    description: Primary scorecard — the GTM artifact.
+                    nullable: true
+                    properties:
+                      backlog_drain_time_s:
+                        format: double
+                        type: number
+                      baseline_p99_ms:
+                        format: double
+                        type: number
+                      overlap_p99_ms:
+                        format: double
+                        type: number
+                      p99_degradation_ratio:
+                        format: double
+                        type: number
+                      peak_backlog:
+                        format: uint64
+                        minimum: 0.0
+                        type: integer
+                      query_error_rate_overlap:
+                        format: double
+                        type: number
+                      recovery_time_s:
+                        format: double
+                        type: number
+                    required:
+                    - backlog_drain_time_s
+                    - baseline_p99_ms
+                    - overlap_p99_ms
+                    - p99_degradation_ratio
+                    - peak_backlog
+                    - query_error_rate_overlap
+                    - recovery_time_s
+                    type: object
+                  valid:
+                    type: boolean
+                  validity_violations:
+                    default: []
+                    items:
+                      type: string
+                    type: array
+                  warnings:
+                    default: []
+                    items:
+                      type: string
+                    type: array
+                required:
+                - harness_saturated
+                - valid
+                type: object
+              run_id:
+                description: Unique run identifier.
+                nullable: true
+                type: string
+              start_time:
+                description: Run start time.
+                nullable: true
+                type: string
+              workers:
+                description: Worker status.
+                nullable: true
+                properties:
+                  ingest_desired:
+                    format: uint32
+                    minimum: 0.0
+                    type: integer
+                  ingest_ready:
+                    format: uint32
+                    minimum: 0.0
+                    type: integer
+                  query_desired:
+                    format: uint32
+                    minimum: 0.0
+                    type: integer
+                  query_ready:
+                    format: uint32
+                    minimum: 0.0
+                    type: integer
+                required:
+                - ingest_desired
+                - ingest_ready
+                - query_desired
+                - query_ready
+                type: object
+            type: object
+        required:
+        - spec
+        title: IncidentBenchRun
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
+

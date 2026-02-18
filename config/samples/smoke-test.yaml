@@ -1,0 +1,212 @@
+---
+apiVersion: incidentbench.io/v1alpha1
+kind: IncidentBenchRun
+metadata:
+  name: smoke-test-001
+  namespace: incidentbench-system
+spec:
+  scenario:
+    scenario:
+      name: "smoke-test"
+      version: "1.0.0"
+      display_name: "Smoke Test"
+      description: "Minimal smoke test to verify operator pipeline"
+      domain: "sre"
+
+    data_streams:
+      - name: "app-logs"
+        schema:
+          index_name: "incidentbench-smoke"
+          timestamp_field: "@timestamp"
+          fields:
+            - name: "@timestamp"
+              type: timestamp
+              generator: now
+            - name: "level"
+              type: keyword
+              generator: weighted_enum
+              config:
+                values:
+                  INFO: 0.70
+                  WARN: 0.20
+                  ERROR: 0.10
+            - name: "service"
+              type: keyword
+              generator: weighted_enum
+              config:
+                values:
+                  api-gateway: 0.50
+                  payment-service: 0.50
+            - name: "message"
+              type: text
+              generator: template
+              config:
+                templates:
+                  INFO:
+                    - "Request processed successfully"
+                  WARN:
+                    - "Slow response from {service}"
+                  ERROR:
+                    - "Connection refused by {service}"
+        data_generator:
+          type: "template"
+          config:
+            seed: 42
+        kafka_partitions: 1
+        ingest_replicas: 1
+        ingest:
+          baseline:         { target_eps: 100, batch_size: 50 }
+          incident_trigger: { target_eps: 200, batch_size: 50 }
+          ingestion_surge:  { target_eps: 500, batch_size: 100 }
+          overlap:          { target_eps: 500, batch_size: 100 }
+          recovery:         { target_eps: 200, batch_size: 50 }
+          post_incident:    { target_eps: 100, batch_size: 50 }
+
+      - name: "security-events"
+        schema:
+          index_name: "incidentbench-security"
+          timestamp_field: "@timestamp"
+          fields:
+            - name: "@timestamp"
+              type: timestamp
+              generator: now
+            - name: "event_type"
+              type: keyword
+              generator: weighted_enum
+              config:
+                values:
+                  login_success: 0.60
+                  login_failure: 0.30
+                  privilege_escalation: 0.10
+            - name: "user"
+              type: keyword
+              generator: weighted_enum
+              config:
+                values:
+                  admin: 0.20
+                  operator: 0.30
+                  viewer: 0.50
+            - name: "source_ip"
+              type: keyword
+              generator: weighted_enum
+              config:
+                values:
+                  "10.0.0.1": 0.40
+                  "10.0.0.2": 0.30
+                  "192.168.1.100": 0.30
+        data_generator:
+          type: "template"
+          config:
+            seed: 43
+        kafka_partitions: 1
+        ingest_replicas: 1
+        ingest:
+          baseline:         { target_eps: 50, batch_size: 50 }
+          incident_trigger: { target_eps: 50, batch_size: 50 }
+          ingestion_surge:  { target_eps: 100, batch_size: 50 }
+          overlap:          { target_eps: 200, batch_size: 100 }
+          recovery:         { target_eps: 100, batch_size: 50 }
+          post_incident:    { target_eps: 50, batch_size: 50 }
+
+    query_mix:
+      queries:
+        - name: "error_search"
+          type: search
+          weight: 0.3
+          template: "level:ERROR"
+          index: "incidentbench-smoke"
+          timeout_ms: 10000
+          description: "Search for errors in app logs"
+        - name: "all_logs"
+          type: search
+          weight: 0.3
+          template: "*"
+          index: "incidentbench-smoke"
+          timeout_ms: 10000
+          limit: 10
+          description: "Recent app logs"
+        - name: "auth_failures"
+          type: search
+          weight: 0.2
+          template: "event_type:login_failure"
+          index: "incidentbench-security"
+          timeout_ms: 10000
+          description: "Search for failed logins"
+        - name: "priv_escalation"
+          type: search
+          weight: 0.2
+          template: "event_type:privilege_escalation"
+          index: "incidentbench-security"
+          timeout_ms: 10000
+          description: "Search for privilege escalation events"
+
+    timeline:
+      phases:
+        - name: "baseline"
+          display_name: "Baseline"
+          duration_seconds: 30
+          query:
+            target_qps: 1.0
+          description: "Normal baseline"
+        - name: "incident_trigger"
+          display_name: "Incident Trigger"
+          duration_seconds: 30
+          query:
+            target_qps: 1.0
+          description: "Error rates spike"
+        - name: "ingestion_surge"
+          display_name: "Ingestion Surge"
+          duration_seconds: 30
+          query:
+            target_qps: 2.0
+          description: "Log volume increases"
+        - name: "overlap"
+          display_name: "Overlap"
+          duration_seconds: 30
+          query:
+            target_qps: 5.0
+          description: "Peak ingest + queries"
+        - name: "recovery"
+          display_name: "Recovery"
+          duration_seconds: 30
+          query:
+            target_qps: 2.0
+          description: "Rates declining"
+        - name: "post_incident"
+          display_name: "Post-Incident"
+          duration_seconds: 30
+          query:
+            target_qps: 1.0
+          description: "Return to normal"
+
+    valid_run_criteria:
+      rules: []
+
+    report:
+      title: "Smoke Test Report"
+      emphasis: []
+
+  images:
+    worker: "10.1.1.210:32000/incidentbench/worker:v0.1.0"
+    reporter: "10.1.1.210:32000/incidentbench/reporter:v0.1.0"
+
+  target:
+    adapter: "mach5"
+    config:
+      endpoint: "http://mach5-nginx.mach5.svc"
+      namespace: "incidentbench-smoke"
+      warehouse:
+        name: "incidentbench-smoke-wh"
+        numMediators: 1
+        numOs: 1
+
+  kafka:
+    bootstrap_servers: "kafka-bootstrap.kafka.svc.cluster.local:9092"
+
+  workers:
+    ingest:
+      replicas: 1
+    query:
+      replicas: 1
+
+  dry_run: false

@@ -1,0 +1,52 @@
+[package]
+name = "incidentbench-common"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# Kubernetes CRD
+kube = { workspace = true }
+k8s-openapi = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+
+# HTTP
+reqwest = { workspace = true }
+
+# Async
+tokio = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+
+# gRPC (for proto-generated types)
+tonic = { workspace = true }
+prost = { workspace = true }
+prost-types = { workspace = true }
+
+# Kafka
+rdkafka = { workspace = true }
+
+# Metrics
+tdigest = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+# Utilities
+uuid = { workspace = true }
+chrono = { workspace = true }
+rand = { workspace = true }
+rand_chacha = { workspace = true }
+siphasher = { workspace = true }
+schemars = { version = "0.8", features = ["chrono"] }
+
+[build-dependencies]
+tonic-build = { workspace = true }

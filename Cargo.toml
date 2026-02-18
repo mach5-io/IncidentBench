@@ -1,0 +1,74 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/incidentbench-common",
+    "crates/incidentbench-operator",
+    "crates/incidentbench-worker",
+    "crates/incidentbench-reporter",
+    "crates/incidentbench-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Kubernetes
+kube = { version = "0.98", features = ["runtime", "derive", "client"] }
+k8s-openapi = { version = "0.24", features = ["latest"] }
+
+# gRPC
+tonic = "0.12"
+tonic-build = "0.12"
+prost = "0.13"
+prost-types = "0.13"
+
+# Kafka
+rdkafka = { version = "0.36", features = ["cmake-build"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+
+# HTTP client
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Terminal UI
+ratatui = "0.29"
+crossterm = "0.28"
+
+# Metrics / math
+tdigest = "0.2"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Hashing
+sha2 = "0.10"
+
+# Utilities
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+rand = "0.8"
+rand_chacha = "0.3"
+siphasher = "1"
+futures = "0.3"
+async-trait = "0.1"
+tokio-stream = { version = "0.1", features = ["net"] }
+async-stream = "0.3"
+
+# Workspace crates
+incidentbench-common = { path = "crates/incidentbench-common" }

@@ -1,0 +1,46 @@
+[package]
+name = "incidentbench-operator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "incidentbench-operator"
+path = "src/main.rs"
+
+[dependencies]
+incidentbench-common = { workspace = true }
+
+# Kubernetes
+kube = { workspace = true }
+k8s-openapi = { workspace = true }
+
+# Async
+tokio = { workspace = true }
+futures = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+
+# gRPC
+tonic = { workspace = true }
+
+# HTTP
+reqwest = { workspace = true }
+
+# Kafka
+rdkafka = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+# Utilities
+uuid = { workspace = true }
+chrono = { workspace = true }
