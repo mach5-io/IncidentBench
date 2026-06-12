@@ -971,6 +971,29 @@ mod tests {
     }
 
     #[test]
+    fn test_query_rate_table_supports_sub_one_qps_per_worker() {
+        let mut scenario = make_test_scenario();
+        for phase in &mut scenario.timeline.phases {
+            phase.query.target_qps = 1.0;
+        }
+
+        let worker_rates: Vec<u64> = (0..4)
+            .map(|worker_index| {
+                let table = scenario.compute_query_rate_table(4, worker_index);
+                table
+                    .phases
+                    .iter()
+                    .find(|p| p.phase_name == "baseline")
+                    .unwrap()
+                    .query_mqps
+            })
+            .collect();
+
+        assert_eq!(worker_rates, vec![250, 250, 250, 250]);
+        assert_eq!(worker_rates.iter().sum::<u64>(), 1000);
+    }
+
+    #[test]
     fn test_total_duration() {
         let scenario = make_test_scenario();
         assert_eq!(scenario.total_duration_seconds(), 180); // 6 * 30

@@ -460,6 +460,9 @@ spec:
                             name:
                               type: string
                             query:
+                              default:
+                                mix_override: null
+                                target_qps: 0.0
                               properties:
                                 mix_override:
                                   additionalProperties:
@@ -468,16 +471,14 @@ spec:
                                   nullable: true
                                   type: object
                                 target_qps:
+                                  default: 0.0
                                   format: double
                                   type: number
-                              required:
-                              - target_qps
                               type: object
                           required:
                           - display_name
                           - duration_seconds
                           - name
-                          - query
                           type: object
                         type: array
                     required:
