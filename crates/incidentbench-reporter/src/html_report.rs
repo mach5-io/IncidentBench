@@ -17,6 +17,7 @@ use incidentbench_common::scenario::Scenario;
 
 /// Generate a self-contained HTML report with embedded CSS and JavaScript.
 /// Uses inline Chart.js for timeline visualization.
+#[allow(clippy::too_many_arguments, clippy::format_in_format_args)]
 pub fn generate(
     scenario: &Scenario,
     timeseries: &TimeSeries,

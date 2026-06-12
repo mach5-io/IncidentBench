@@ -143,10 +143,7 @@ pub fn build_sql_files_configmap(
             } else if path.extension().and_then(|e| e.to_str()) == Some("sql") {
                 let relative = path.strip_prefix(root).unwrap_or(&path);
                 // Convert "basic-search/01-query.sql" → "basic-search_01-query.sql"
-                let key = relative
-                    .to_string_lossy()
-                    .replace('/', "_")
-                    .replace('\\', "_");
+                let key = relative.to_string_lossy().replace(['/', '\\'], "_");
                 if let Ok(content) = std::fs::read_to_string(&path) {
                     data.insert(key, content);
                 }

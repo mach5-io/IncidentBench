@@ -712,6 +712,7 @@ fn generate_query_variables(query: &QueryDef, rng: &mut ChaCha8Rng) -> HashMap<S
     vars
 }
 
+#[allow(clippy::too_many_arguments)]
 fn query_error_record(
     query: &QueryDef,
     category: &str,
@@ -739,6 +740,7 @@ fn query_error_record(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn query_error_record_parts(
     query_name: &str,
     category: &str,
@@ -812,7 +814,7 @@ fn truncate_error_message(message: &str) -> String {
         message.to_string()
     } else {
         let mut s = message[..MAX_LEN].to_string();
-        s.push_str("…");
+        s.push('…');
         s
     }
 }
