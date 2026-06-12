@@ -20,8 +20,19 @@ use async_trait::async_trait;
 use reqwest::Client;
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+use tokio_postgres::NoTls;
 use tracing::{debug, info, warn};
+
+struct PgConfig {
+    host: String,
+    port: u16,
+    user: String,
+    password: String,
+    dbname: String,
+    /// Mach5 warehouse name — passed as PostgreSQL startup option.
+    warehouse: String,
+}
 
 /// Mach5 target adapter.
 ///
@@ -40,6 +51,17 @@ pub struct Mach5Adapter {
     namespace: String,
     /// Kafka connection name (deterministic, shared across runs).
     connection_name: String,
+    /// PostgreSQL gateway config — present when sql queries are expected.
+    pg_config: Option<PgConfig>,
+    /// One connection per session category (or per query name outside session mode)
+    /// so each logical execution lane has its own backend PID. This keeps a pgwire
+    /// CancelRequest scoped to the active statement for that lane instead of whatever
+    /// later statement happens to reuse a shared connection.
+    /// Arc allows cloning the pointer out of the lock before executing, so the
+    /// lock is held only during init/lookup — not for the duration of the query.
+    pg_clients: tokio::sync::Mutex<
+        std::collections::HashMap<String, std::sync::Arc<tokio_postgres::Client>>,
+    >,
 }
 
 impl Mach5Adapter {
@@ -57,6 +79,48 @@ impl Mach5Adapter {
             .ok_or_else(|| anyhow::anyhow!("Mach5 adapter requires 'namespace' in config (the adapter creates and deletes this namespace)"))?
             .to_string();
 
+        // PostgreSQL gateway config — all fields optional; sql queries require them at runtime.
+        let pg_config = {
+            let host = config
+                .get("pg_host")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let port = config
+                .get("pg_port")
+                .and_then(|v| v.as_u64())
+                .map(|p| p as u16)
+                .unwrap_or(5432);
+            let user = config
+                .get("pg_user")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let password = config
+                .get("pg_password")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let dbname = config
+                .get("pg_dbname")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let warehouse = config
+                .get("warehouse")
+                .and_then(|v| v.get("name"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            match (host, user, password, dbname) {
+                (Some(host), Some(user), Some(password), Some(dbname)) => Some(PgConfig {
+                    host,
+                    port,
+                    user,
+                    password,
+                    dbname,
+                    warehouse,
+                }),
+                _ => None,
+            }
+        };
+
         Ok(Self {
             client: Client::builder()
                 .danger_accept_invalid_certs(true) // TODO: make configurable
@@ -64,6 +128,8 @@ impl Mach5Adapter {
             endpoint,
             namespace,
             connection_name: "incidentbench-kafka-conn".to_string(),
+            pg_config,
+            pg_clients: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         })
     }
 
@@ -103,6 +169,104 @@ impl Mach5Adapter {
                 // Fallback: try to parse as a simple term query.
                 json!({
                     "query": { "query_string": { "query": template } }
+                })
+            }
+        }
+    }
+
+    pub(crate) async fn execute_sql_query(&self, query: &QueryDef) -> anyhow::Result<QueryResult> {
+        let cfg = self.pg_config.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "SQL query requires pg_host/pg_user/pg_password/pg_dbname in adapter config"
+            )
+        })?;
+
+        // Session mode fires one query per category per tick, then round-robins within
+        // that category on later ticks. Reuse one pg connection per category so the
+        // backend PID remains stable for that logical lane across timeouts and retries.
+        // Outside session mode, fall back to query name to avoid collapsing unrelated
+        // queries onto the same PID.
+        let client_key = query.category.as_deref().unwrap_or(&query.name).to_string();
+
+        // A pgwire CancelRequest targets a PID — a shared connection would cause a cancel
+        // for one logical lane to hit whichever query is currently executing on that PID.
+        // Arc lets us clone the pointer out before dropping the lock so execution is
+        // fully concurrent across categories.
+        let pg: std::sync::Arc<tokio_postgres::Client> = {
+            let mut clients = self.pg_clients.lock().await;
+            if !clients.contains_key(&client_key) {
+                let mut conn_str = format!(
+                    "host={} port={} user={} password={} dbname={}",
+                    cfg.host, cfg.port, cfg.user, cfg.password, cfg.dbname
+                );
+                if !cfg.warehouse.is_empty() {
+                    conn_str.push_str(&format!(" options='-c warehouse={}'", cfg.warehouse));
+                }
+                let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("PostgreSQL connection failed: {}", e))?;
+                tokio::spawn(connection);
+                clients.insert(client_key.clone(), std::sync::Arc::new(client));
+            }
+            std::sync::Arc::clone(clients.get(&client_key).unwrap())
+        }; // lock released — other category queries initialise / execute concurrently
+
+        // Prefer inline sql field; fall back to reading from sql_file mount path; then template.
+        let sql_owned;
+        let sql: &str = if let Some(inline) = query.sql.as_deref().filter(|s| !s.is_empty()) {
+            inline
+        } else if let Some(file_path) = &query.sql_file {
+            let mount_key = file_path.replace('/', "_");
+            let full_path = format!("/queries/{}", mount_key);
+            sql_owned = std::fs::read_to_string(&full_path)
+                .map_err(|e| anyhow::anyhow!("Failed to read SQL file {}: {}", full_path, e))?;
+            &sql_owned
+        } else {
+            query.template.as_str()
+        };
+
+        let timeout_ms = if query.timeout_ms > 0 {
+            query.timeout_ms
+        } else {
+            10_000
+        };
+        // cancel_token captures this connection's backend PID/key — owned value, no lock needed.
+        let cancel_token = pg.cancel_token();
+        let start = Instant::now();
+
+        let result =
+            tokio::time::timeout(Duration::from_millis(timeout_ms), pg.query(sql, &[])).await;
+        let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+        match result {
+            Ok(Ok(rows)) => Ok(QueryResult {
+                hit_count: rows.len() as u64,
+                row_count: Some(rows.len() as u64),
+                duration_ms,
+                ..Default::default()
+            }),
+            Ok(Err(e)) => Ok(QueryResult {
+                error: Some(e.to_string()),
+                duration_ms,
+                ..Default::default()
+            }),
+            Err(_elapsed) => {
+                // Send pgwire CancelRequest to the Mach5 gateway. The gateway maps this
+                // connection's backend PID to the active MDX query_id and cancels only
+                // that statement. The connection background task drains the resulting
+                // ErrorResponse + ReadyForQuery and returns to idle — no reconnect needed.
+                if let Err(e) = cancel_token.cancel_query(NoTls).await {
+                    warn!(
+                        query = %query.name,
+                        timeout_ms,
+                        "Failed to send CancelRequest: {}",
+                        e
+                    );
+                }
+                Ok(QueryResult {
+                    duration_ms,
+                    timed_out: true,
+                    ..Default::default()
                 })
             }
         }
@@ -356,139 +520,144 @@ impl TargetAdapter for Mach5Adapter {
             info!("Mach5 namespace created: {}", ns);
         }
 
-        // Step 1: Create Kafka connection.
-        let conn_url = format!("{}/namespaces/{}/connections/{}", base, ns, conn_name);
-        let conn_body = json!({
-            "kafka": {
-                "bootstrap_servers": kafka_bootstrap_servers
-            }
-        });
-        debug!("Creating Kafka connection: {}", conn_url);
-        let conn_resp = self.client.put(&conn_url).json(&conn_body).send().await?;
-        if !conn_resp.status().is_success() {
-            let status = conn_resp.status();
-            let body = conn_resp.text().await.unwrap_or_default();
-            if status.as_u16() == 409
-                || body.contains("AlreadyExists")
-                || body.contains("already exists")
-            {
-                info!("Kafka connection already exists: {}", conn_name);
-            } else {
-                anyhow::bail!("Failed to create Kafka connection ({}): {}", status, body);
-            }
-        } else {
-            info!("Kafka connection created: {}", conn_name);
-        }
-
-        // Step 2: Create indexes for all streams in parallel.
-        let mut index_futures = Vec::new();
-        for stream in streams {
-            let index_name = &stream.schema.index_name;
-            let index_url = format!("{}/namespaces/{}/indexes/{}", base, ns, index_name);
-            let mappings = Self::build_mappings(&stream.schema.fields);
-            let index_body = json!({
-                "settings": {
-                    "index": {
-                        "number_of_shards": 1,
-                        "number_of_replicas": 0
-                    }
-                },
-                "mappings": mappings,
-                "aliases": {}
-            });
-            debug!("Creating index: {}", index_url);
-            let client = &self.client;
-            let idx_name = index_name.clone();
-            index_futures.push(async move {
-                let resp = client.put(&index_url).json(&index_body).send().await?;
-                if !resp.status().is_success() {
-                    let status = resp.status();
-                    let body = resp.text().await.unwrap_or_default();
-                    if status.as_u16() == 409
-                        || body.contains("AlreadyExists")
-                        || body.contains("already exists")
-                    {
-                        info!("Index already exists: {}", idx_name);
-                    } else {
-                        anyhow::bail!(
-                            "Failed to create index '{}' ({}): {}",
-                            idx_name,
-                            status,
-                            body
-                        );
-                    }
-                } else {
-                    info!("Index created: {}", idx_name);
-                }
-                Ok::<_, anyhow::Error>(())
-            });
-        }
-        futures::future::try_join_all(index_futures).await?;
-
-        // Step 3: Create ingest pipelines for all streams in parallel.
         let mut consumer_groups: HashMap<String, String> = HashMap::new();
-        let mut pipeline_futures = Vec::new();
-        for stream in streams {
-            let index_name = &stream.schema.index_name;
-            let pipeline_name = format!("{}-pipeline", index_name);
-            let consumer_group = format!("{}-cg", index_name);
-            consumer_groups.insert(stream.name.clone(), consumer_group.clone());
 
-            let pipeline_url = format!(
-                "{}/namespaces/{}/ingest_pipelines/{}",
-                base, ns, pipeline_name
-            );
-            let pipeline_body = json!({
-                "index": index_name,
-                "source_config": {
-                    "connection": {
-                        "namespace": ns,
-                        "name": conn_name
-                    },
-                    "config": {
-                        "type": "kafka",
-                        "topic": &stream.kafka_topic,
-                        "group_id": &consumer_group,
-                        "data_format": "json"
-                    }
-                },
-                "op_mode": "appendorupsert",
-                "enabled": true,
-                "poll_frequency_secs": 5,
-                "max_ingest_workflows_limit": 4
-            });
-            debug!("Creating ingest pipeline: {}", pipeline_url);
-            let client = &self.client;
-            let p_name = pipeline_name.clone();
-            pipeline_futures.push(async move {
-                let resp = client
-                    .put(&pipeline_url)
-                    .json(&pipeline_body)
-                    .send()
-                    .await?;
-                if !resp.status().is_success() {
-                    let status = resp.status();
-                    let body = resp.text().await.unwrap_or_default();
-                    if status.as_u16() == 409
-                        || body.contains("AlreadyExists")
-                        || body.contains("already exists")
-                    {
-                        info!("Ingest pipeline already exists: {}", p_name);
-                    } else {
-                        anyhow::bail!(
-                            "Failed to create ingest pipeline '{}' ({}): {}",
-                            p_name,
-                            status,
-                            body
-                        );
-                    }
-                } else {
-                    info!("Ingest pipeline created: {}", p_name);
+        if !streams.is_empty() {
+            // Step 1: Create Kafka connection.
+            let conn_url = format!("{}/namespaces/{}/connections/{}", base, ns, conn_name);
+            let conn_body = json!({
+                "kafka": {
+                    "bootstrap_servers": kafka_bootstrap_servers
                 }
-                Ok::<_, anyhow::Error>(())
             });
+            debug!("Creating Kafka connection: {}", conn_url);
+            let conn_resp = self.client.put(&conn_url).json(&conn_body).send().await?;
+            if !conn_resp.status().is_success() {
+                let status = conn_resp.status();
+                let body = conn_resp.text().await.unwrap_or_default();
+                if status.as_u16() == 409
+                    || body.contains("AlreadyExists")
+                    || body.contains("already exists")
+                {
+                    info!("Kafka connection already exists: {}", conn_name);
+                } else {
+                    anyhow::bail!("Failed to create Kafka connection ({}): {}", status, body);
+                }
+            } else {
+                info!("Kafka connection created: {}", conn_name);
+            }
+
+            // Step 2: Create indexes for all streams in parallel.
+            let mut index_futures = Vec::new();
+            for stream in streams {
+                let index_name = &stream.schema.index_name;
+                let index_url = format!("{}/namespaces/{}/indexes/{}", base, ns, index_name);
+                let mappings = Self::build_mappings(&stream.schema.fields);
+                let index_body = json!({
+                    "settings": {
+                        "index": {
+                            "number_of_shards": 1,
+                            "number_of_replicas": 0
+                        }
+                    },
+                    "mappings": mappings,
+                    "aliases": {}
+                });
+                debug!("Creating index: {}", index_url);
+                let client = &self.client;
+                let idx_name = index_name.clone();
+                index_futures.push(async move {
+                    let resp = client.put(&index_url).json(&index_body).send().await?;
+                    if !resp.status().is_success() {
+                        let status = resp.status();
+                        let body = resp.text().await.unwrap_or_default();
+                        if status.as_u16() == 409
+                            || body.contains("AlreadyExists")
+                            || body.contains("already exists")
+                        {
+                            info!("Index already exists: {}", idx_name);
+                        } else {
+                            anyhow::bail!(
+                                "Failed to create index '{}' ({}): {}",
+                                idx_name,
+                                status,
+                                body
+                            );
+                        }
+                    } else {
+                        info!("Index created: {}", idx_name);
+                    }
+                    Ok::<_, anyhow::Error>(())
+                });
+            }
+            futures::future::try_join_all(index_futures).await?;
+
+            // Step 3: Create ingest pipelines for all streams in parallel.
+            let mut pipeline_futures = Vec::new();
+            for stream in streams {
+                let index_name = &stream.schema.index_name;
+                let pipeline_name = format!("{}-pipeline", index_name);
+                let consumer_group = format!("{}-cg", index_name);
+                consumer_groups.insert(stream.name.clone(), consumer_group.clone());
+
+                let pipeline_url = format!(
+                    "{}/namespaces/{}/ingest_pipelines/{}",
+                    base, ns, pipeline_name
+                );
+                let pipeline_body = json!({
+                    "index": index_name,
+                    "source_config": {
+                        "connection": {
+                            "namespace": ns,
+                            "name": conn_name
+                        },
+                        "config": {
+                            "type": "kafka",
+                            "topic": &stream.kafka_topic,
+                            "group_id": &consumer_group,
+                            "data_format": "json"
+                        }
+                    },
+                    "op_mode": "appendorupsert",
+                    "enabled": true,
+                    "poll_frequency_secs": 5,
+                    "max_ingest_workflows_limit": 4
+                });
+                debug!("Creating ingest pipeline: {}", pipeline_url);
+                let client = &self.client;
+                let p_name = pipeline_name.clone();
+                pipeline_futures.push(async move {
+                    let resp = client
+                        .put(&pipeline_url)
+                        .json(&pipeline_body)
+                        .send()
+                        .await?;
+                    if !resp.status().is_success() {
+                        let status = resp.status();
+                        let body = resp.text().await.unwrap_or_default();
+                        if status.as_u16() == 409
+                            || body.contains("AlreadyExists")
+                            || body.contains("already exists")
+                        {
+                            info!("Ingest pipeline already exists: {}", p_name);
+                        } else {
+                            anyhow::bail!(
+                                "Failed to create ingest pipeline '{}' ({}): {}",
+                                p_name,
+                                status,
+                                body
+                            );
+                        }
+                    } else {
+                        info!("Ingest pipeline created: {}", p_name);
+                    }
+                    Ok::<_, anyhow::Error>(())
+                });
+            }
+            futures::future::try_join_all(pipeline_futures).await?;
+        } else {
+            info!("No data streams — skipping Kafka connection and ingest pipeline setup");
         }
-        futures::future::try_join_all(pipeline_futures).await?;
 
         // Step 4: Create all warehouses in parallel.
         // Deduplicate — multiple groups may reference the same warehouse name.
@@ -560,69 +729,78 @@ impl TargetAdapter for Mach5Adapter {
 
         let results = futures::future::try_join_all(warehouse_futures).await?;
 
-        // Step 5: Resolve warehouse OS endpoints and poll until ready for queries.
-        // Use the first stream's index for the readiness check.
-        let first_index = streams
-            .first()
-            .map(|s| s.schema.index_name.as_str())
-            .unwrap_or("_cat");
-
+        // Step 5: Poll warehouse readiness via the Mach5 REST API, then record query endpoints.
+        // Polling via the API (rather than directly hitting the OS service) works whether the
+        // operator runs in-cluster or remotely (cross-cluster / kind dev setup).
         let mut query_endpoints: HashMap<String, String> = HashMap::new();
         for wh_name in &results {
             let warehouse_get_url = format!("{}/namespaces/{}/warehouses/{}", base, ns, wh_name);
             info!("Waiting for warehouse '{}' to become ready...", wh_name);
 
-            // Get warehouse ID to derive the OS service name.
-            let wh_resp = self.client.get(&warehouse_get_url).send().await?;
-            let wh_body: Value = wh_resp.json().await?;
-            let wh_id = wh_body
-                .get("id")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow::anyhow!("Warehouse '{}' missing 'id' field", wh_name))?;
+            // Give the warehouse controller a moment to schedule pods before polling.
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 
-            // Mach5 warehouse controller names the OS service: warehouse-os-{id[:34]}
-            let id_len = wh_id.len().min(34);
-            let id_prefix = &wh_id[..id_len];
-            let os_endpoint = format!(
-                "http://warehouse-os-{}.mach5.svc.cluster.local:9200",
-                id_prefix
-            );
-            info!(
-                "Warehouse '{}' id={}. Polling OS endpoint: {}",
-                wh_name, wh_id, os_endpoint
-            );
-
-            // Poll: try to search the first index on the warehouse OS until it responds with 200.
-            let search_url = format!("{}/{}/_search?size=0", os_endpoint, first_index);
-            loop {
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                match self
-                    .client
-                    .post(&search_url)
-                    .json(&json!({"query": {"match_all": {}}}))
-                    .send()
-                    .await
-                {
-                    Ok(resp) if resp.status().is_success() => {
-                        info!("Warehouse '{}' ready for queries: {}", wh_name, os_endpoint);
-                        break;
-                    }
+            let wh_id = loop {
+                match self.client.get(&warehouse_get_url).send().await {
                     Ok(resp) => {
-                        debug!(
-                            "Warehouse '{}' not ready yet (HTTP {}), retrying in 5s...",
-                            wh_name,
-                            resp.status()
-                        );
+                        let body: Value = match resp.json().await {
+                            Ok(b) => b,
+                            Err(e) => {
+                                debug!("Warehouse '{}' status parse error: {}", wh_name, e);
+                                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                                continue;
+                            }
+                        };
+                        let id = body
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        // Mach5 API has no explicit status field — enabled:true means the
+                        // warehouse resource exists and the controller has accepted it.
+                        // Use enabled:true as the readiness signal; explicit status fields
+                        // (if added in future API versions) also accepted.
+                        let explicit_status =
+                            body.get("status").and_then(|v| v.as_str()).unwrap_or("");
+                        let enabled = body
+                            .get("enabled")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        let is_ready = enabled
+                            || explicit_status == "ready"
+                            || explicit_status == "Running"
+                            || explicit_status == "running";
+                        if is_ready && !id.is_empty() {
+                            info!(
+                                "Warehouse '{}' is ready (enabled={}, status='{}')",
+                                wh_name, enabled, explicit_status
+                            );
+                            break id;
+                        }
+                        debug!("Warehouse '{}' not ready yet (enabled={}, status='{}'), retrying in 5s...", wh_name, enabled, explicit_status);
                     }
                     Err(e) => {
                         debug!(
-                            "Warehouse '{}' OS not reachable ({}), retrying in 5s...",
+                            "Warehouse '{}' API not reachable ({}), retrying in 5s...",
                             wh_name, e
                         );
                     }
                 }
-            }
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            };
 
+            // Build the query endpoint: use the Mach5 nginx proxy URL so it works from any
+            // network location. Direct OS service URLs only work in-cluster.
+            let id_len = wh_id.len().min(34);
+            let id_prefix = &wh_id[..id_len.max(1)];
+            let os_endpoint = format!(
+                "{}/namespaces/{}/warehouses/{}/query",
+                self.endpoint, ns, wh_name
+            );
+            info!(
+                "Warehouse '{}' id={}. Query endpoint: {}",
+                wh_name, id_prefix, os_endpoint
+            );
             query_endpoints.insert(wh_name.clone(), os_endpoint);
         }
 
@@ -639,11 +817,15 @@ impl TargetAdapter for Mach5Adapter {
         query_endpoint: &str,
         variables: &HashMap<String, String>,
     ) -> anyhow::Result<QueryResult> {
+        if query.query_type == "sql" {
+            return self.execute_sql_query(query).await;
+        }
+
         let url = format!("{}/{}/_search", query_endpoint, index_name);
         let body = Self::build_query_body(query, variables);
 
         let start = Instant::now();
-        let timeout = std::time::Duration::from_millis(query.timeout_ms.max(1000));
+        let timeout = Duration::from_millis(query.timeout_ms.max(1000));
 
         let resp = self
             .client
@@ -668,24 +850,28 @@ impl TargetAdapter for Mach5Adapter {
 
                     Ok(QueryResult {
                         hit_count,
-                        error: None,
                         duration_ms,
+                        ..Default::default()
                     })
                 } else {
                     let status = response.status();
                     let err_body = response.text().await.unwrap_or_default();
                     Ok(QueryResult {
-                        hit_count: 0,
                         error: Some(format!("HTTP {}: {}", status, err_body)),
                         duration_ms,
+                        ..Default::default()
                     })
                 }
             }
-            Err(e) => Ok(QueryResult {
-                hit_count: 0,
-                error: Some(format!("Request failed: {}", e)),
-                duration_ms,
-            }),
+            Err(e) => {
+                let timed_out = e.is_timeout();
+                Ok(QueryResult {
+                    error: Some(format!("Request failed: {}", e)),
+                    duration_ms,
+                    timed_out,
+                    ..Default::default()
+                })
+            }
         }
     }
 
@@ -738,22 +924,24 @@ impl TargetAdapter for Mach5Adapter {
             }));
         }
 
-        // Delete warehouses.
-        for wh_name in &unique_wh_names {
-            let url = format!("{}/namespaces/{}/warehouses/{}", base, ns, wh_name);
-            let name = wh_name.clone();
-            delete_futures.push(Box::pin(async move {
-                match self.client.delete(&url).send().await {
-                    Ok(resp) => {
-                        if resp.status().is_success() || resp.status().as_u16() == 404 {
-                            info!("Deleted warehouse: {}", name);
-                        } else {
-                            warn!("Failed to delete warehouse '{}': {}", name, resp.status());
+        // Delete warehouses (skip for protected namespaces — warehouse is pre-existing).
+        if ns != "default" {
+            for wh_name in &unique_wh_names {
+                let url = format!("{}/namespaces/{}/warehouses/{}", base, ns, wh_name);
+                let name = wh_name.clone();
+                delete_futures.push(Box::pin(async move {
+                    match self.client.delete(&url).send().await {
+                        Ok(resp) => {
+                            if resp.status().is_success() || resp.status().as_u16() == 404 {
+                                info!("Deleted warehouse: {}", name);
+                            } else {
+                                warn!("Failed to delete warehouse '{}': {}", name, resp.status());
+                            }
                         }
+                        Err(e) => warn!("Failed to delete warehouse '{}': {}", name, e),
                     }
-                    Err(e) => warn!("Failed to delete warehouse '{}': {}", name, e),
-                }
-            }));
+                }));
+            }
         }
 
         futures::future::join_all(delete_futures).await;
@@ -806,18 +994,25 @@ impl TargetAdapter for Mach5Adapter {
 
         futures::future::join_all(delete_futures2).await;
 
-        // Step 3: Delete the Mach5 namespace itself.
-        let ns_url = format!("{}/namespaces/{}", base, ns);
-        let ns_result = self.client.delete(&ns_url).send().await;
-        if let Ok(resp) = ns_result {
-            if resp.status().is_success() || resp.status().as_u16() == 404 {
-                info!("Deleted Mach5 namespace: {}", ns);
-            } else {
-                warn!(
-                    "Failed to delete Mach5 namespace '{}': {}",
-                    ns,
-                    resp.status()
-                );
+        // Step 3: Delete the Mach5 namespace itself (skip for protected namespaces).
+        if ns == "default" {
+            info!(
+                "Skipping namespace deletion for protected namespace '{}'",
+                ns
+            );
+        } else {
+            let ns_url = format!("{}/namespaces/{}", base, ns);
+            let ns_result = self.client.delete(&ns_url).send().await;
+            if let Ok(resp) = ns_result {
+                if resp.status().is_success() || resp.status().as_u16() == 404 {
+                    info!("Deleted Mach5 namespace: {}", ns);
+                } else {
+                    warn!(
+                        "Failed to delete Mach5 namespace '{}': {}",
+                        ns,
+                        resp.status()
+                    );
+                }
             }
         }
 

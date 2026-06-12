@@ -1,0 +1,374 @@
+---
+# IncidentBench query-only run targeting the Mach5 PostgreSQL gateway.
+#
+# Prerequisites:
+#   - A Mach5 warehouse already loaded with data to query.
+#   - SQL query files stored in a ConfigMap named "<run-name>-queries"
+#     and mounted at /queries/ inside query worker pods.
+#     Example: kubectl create configmap mach5-qb-run-001-queries \
+#                --from-file=alert_search.sql=./queries/alert_search.sql \
+#                --from-file=top_sources_agg.sql=./queries/top_sources_agg.sql \
+#                --from-file=incident_timeline.sql=./queries/incident_timeline.sql \
+#                --from-file=trace_lookup.sql=./queries/trace_lookup.sql
+#
+# Because data_streams is absent no Kafka topics, ingest pipeline, or
+# ingest worker Deployments are created.
+
+apiVersion: incidentbench.io/v1alpha1
+kind: IncidentBenchRun
+metadata:
+  name: mach5-qb-run-001
+  namespace: incidentbench-system
+spec:
+  scenario:
+    scenario:
+      name: "mach5-query-bench"
+      version: "1.0.0"
+      display_name: "Mach5 Query Benchmark"
+      description: >
+        Measures Mach5 query performance against a pre-loaded dataset using the
+        PostgreSQL-compatible gateway. No ingest workers are created.
+      domain: "sre"
+
+    # data_streams: absent — query-only run.
+
+    query_mix:
+      queries:
+        # --- basic-search (8 queries, round-robin per session tick) ---
+        - name: "bs-01-all-eur"
+          type: "sql"
+          category: "basic-search"
+          template: ""
+          index: ""
+          timeout_ms: 10000
+          sql: >-
+            SELECT * FROM "opensearch_dashboards_sample_data_ecommerce"
+            WHERE currency = 'EUR' LIMIT 25
+
+        - name: "bs-02-high-value"
+          type: "sql"
+          category: "basic-search"
+          template: ""
+          index: ""
+          timeout_ms: 10000
+          sql: >-
+            SELECT order_id, customer_full_name, taxful_total_price
+            FROM "opensearch_dashboards_sample_data_ecommerce"
+            WHERE taxful_total_price > 100 LIMIT 25
+
+        - name: "bs-03-male-customers"
+          type: "sql"
+          category: "basic-search"
+          template: ""
+          index: ""
+          timeout_ms: 10000
+          sql: >-
+            SELECT * FROM "opensearch_dashboards_sample_data_ecommerce"
+            WHERE customer_gender = 'MALE' LIMIT 25
+
+        - name: "bs-04-monday-orders"
+          type: "sql"
+          category: "basic-search"
+          template: ""
+          index: ""
+          timeout_ms: 10000
+          sql: >-
+            SELECT order_id, order_date, taxful_total_price
+            FROM "opensearch_dashboards_sample_data_ecommerce"
+            WHERE day_of_week = 'Monday' ORDER BY taxful_total_price DESC LIMIT 25
+
+        - name: "bs-05-female-high-value"
+          type: "sql"
+          category: "basic-search"
+          template: ""
+          index: ""
+          timeout_ms: 10000
+          sql: >-
+            SELECT order_id, customer_full_name, taxful_total_price
+            FROM "opensearch_dashboards_sample_data_ecommerce"
+            WHERE customer_gender = 'FEMALE' AND taxful_total_price > 150 LIMIT 25
+
+        - name: "bs-06-low-value"
+          type: "sql"
+          category: "basic-search"
+          template: ""
+          index: ""
+          timeout_ms: 10000
+          sql: >-
+            SELECT count(*) FROM "opensearch_dashboards_sample_data_ecommerce"
+            WHERE taxful_total_price < 20
+
+        - name: "bs-07-weekend"
+          type: "sql"
+          category: "basic-search"
+          template: ""
+          index: ""
+          timeout_ms: 10000
+          sql: >-
+            SELECT * FROM "opensearch_dashboards_sample_data_ecommerce"
+            WHERE day_of_week IN ('Saturday', 'Sunday') LIMIT 25
+
+        - name: "bs-08-total-count"
+          type: "sql"
+          category: "basic-search"
+          template: ""
+          index: ""
+          timeout_ms: 10000
+          sql: >-
+            SELECT count(*) FROM "opensearch_dashboards_sample_data_ecommerce"
+
+        # --- pie-chart (3 queries, round-robin per session tick) ---
+        - name: "pc-04-top-manufacturers"
+          type: "sql"
+          category: "pie-chart"
+          template: ""
+          index: ""
+          timeout_ms: 10000
+          sql: >-
+            SELECT manufacturer, count(*) as cnt
+            FROM "opensearch_dashboards_sample_data_ecommerce"
+            GROUP BY manufacturer ORDER BY cnt DESC LIMIT 10
+
+        - name: "pc-05-gender-split"
+          type: "sql"
+          category: "pie-chart"
+          template: ""
+          index: ""
+          timeout_ms: 10000
+          sql: >-
+            SELECT customer_gender, count(*), avg(taxful_total_price)
+            FROM "opensearch_dashboards_sample_data_ecommerce"
+            GROUP BY customer_gender
+
+        - name: "pc-06-revenue-by-day"
+          type: "sql"
+          category: "pie-chart"
+          template: ""
+          index: ""
+          timeout_ms: 10000
+          sql: >-
+            SELECT day_of_week, count(*), sum(taxful_total_price)
+            FROM "opensearch_dashboards_sample_data_ecommerce"
+            GROUP BY day_of_week ORDER BY sum(taxful_total_price) DESC
+
+        # --- time-series (3 queries, round-robin per session tick) ---
+        - name: "ts-01-count-by-currency"
+          type: "sql"
+          category: "time-series"
+          template: ""
+          index: ""
+          timeout_ms: 10000
+          sql: >-
+            SELECT currency, count(*)
+            FROM "opensearch_dashboards_sample_data_ecommerce"
+            GROUP BY currency
+
+        - name: "ts-02-avg-value-by-day"
+          type: "sql"
+          category: "time-series"
+          template: ""
+          index: ""
+          timeout_ms: 10000
+          sql: >-
+            SELECT day_of_week, avg(taxful_total_price), count(*)
+            FROM "opensearch_dashboards_sample_data_ecommerce"
+            GROUP BY day_of_week ORDER BY avg(taxful_total_price) DESC
+
+        - name: "ts-03-top-countries"
+          type: "sql"
+          category: "time-series"
+          template: ""
+          index: ""
+          timeout_ms: 10000
+          sql: >-
+            SELECT customer_country, count(*), avg(taxful_total_price)
+            FROM "opensearch_dashboards_sample_data_ecommerce"
+            GROUP BY customer_country ORDER BY count(*) DESC LIMIT 20
+
+        # --- logs: basic-search (4 queries) ---
+        - name: "lg-01-errors"
+          type: "sql"
+          category: "logs"
+          template: ""
+          index: ""
+          timeout_ms: 10000
+          sql: >-
+            SELECT timestamp, clientip, request, response, bytes
+            FROM "opensearch_dashboards_sample_data_logs"
+            WHERE response >= '500' ORDER BY timestamp DESC LIMIT 25
+
+        - name: "lg-02-not-found"
+          type: "sql"
+          category: "logs"
+          template: ""
+          index: ""
+          timeout_ms: 10000
+          sql: >-
+            SELECT timestamp, clientip, request, bytes
+            FROM "opensearch_dashboards_sample_data_logs"
+            WHERE response = '404' ORDER BY timestamp DESC LIMIT 25
+
+        - name: "lg-03-large-responses"
+          type: "sql"
+          category: "logs"
+          template: ""
+          index: ""
+          timeout_ms: 10000
+          sql: >-
+            SELECT timestamp, clientip, request, response, bytes
+            FROM "opensearch_dashboards_sample_data_logs"
+            WHERE bytes > 10000 ORDER BY bytes DESC LIMIT 25
+
+        - name: "lg-04-by-host"
+          type: "sql"
+          category: "logs"
+          template: ""
+          index: ""
+          timeout_ms: 10000
+          sql: >-
+            SELECT timestamp, clientip, request, response, bytes
+            FROM "opensearch_dashboards_sample_data_logs"
+            WHERE host = 'cdn.elastic-elastic-elastic.org' ORDER BY timestamp DESC LIMIT 25
+
+        # --- logs: aggregations (6 queries) ---
+        - name: "lg-05-response-code-dist"
+          type: "sql"
+          category: "logs"
+          template: ""
+          index: ""
+          timeout_ms: 10000
+          sql: >-
+            SELECT response, count(*) as cnt
+            FROM "opensearch_dashboards_sample_data_logs"
+            GROUP BY response ORDER BY cnt DESC
+
+        - name: "lg-06-top-client-ips"
+          type: "sql"
+          category: "logs"
+          template: ""
+          index: ""
+          timeout_ms: 10000
+          sql: >-
+            SELECT clientip, count(*) as cnt
+            FROM "opensearch_dashboards_sample_data_logs"
+            GROUP BY clientip ORDER BY cnt DESC LIMIT 10
+
+        - name: "lg-07-bytes-by-host"
+          type: "sql"
+          category: "logs"
+          template: ""
+          index: ""
+          timeout_ms: 10000
+          sql: >-
+            SELECT host, count(*) as requests, sum(bytes) as total_bytes, avg(bytes) as avg_bytes
+            FROM "opensearch_dashboards_sample_data_logs"
+            GROUP BY host ORDER BY total_bytes DESC
+
+        - name: "lg-08-os-breakdown"
+          type: "sql"
+          category: "logs"
+          template: ""
+          index: ""
+          timeout_ms: 10000
+          sql: >-
+            SELECT "machine.os", count(*) as cnt
+            FROM "opensearch_dashboards_sample_data_logs"
+            GROUP BY "machine.os" ORDER BY cnt DESC
+
+        - name: "lg-09-geo-dest"
+          type: "sql"
+          category: "logs"
+          template: ""
+          index: ""
+          timeout_ms: 10000
+          sql: >-
+            SELECT "geo.dest", count(*) as cnt
+            FROM "opensearch_dashboards_sample_data_logs"
+            GROUP BY "geo.dest" ORDER BY cnt DESC LIMIT 20
+
+        - name: "lg-10-error-rate-by-host"
+          type: "sql"
+          category: "logs"
+          template: ""
+          index: ""
+          timeout_ms: 10000
+          sql: >-
+            SELECT host,
+                   count(*) as total,
+                   count(CASE WHEN response >= '400' THEN 1 END) as errors
+            FROM "opensearch_dashboards_sample_data_logs"
+            GROUP BY host ORDER BY errors DESC
+
+    timeline:
+      phases:
+        - name: "warmup"
+          display_name: "Warm-up"
+          duration_seconds: 60
+          query:
+            target_qps: 2.0
+
+        - name: "baseline"
+          display_name: "Baseline"
+          duration_seconds: 180
+          query:
+            target_qps: 5.0
+
+        - name: "stress"
+          display_name: "Stress"
+          duration_seconds: 240
+          query:
+            target_qps: 10.0
+
+        - name: "recovery"
+          display_name: "Recovery"
+          duration_seconds: 120
+          query:
+            target_qps: 5.0
+
+    valid_run_criteria:
+      rules:
+        - name: "baseline_p99_under_5s"
+          condition: "baseline_p99_ms < 5000"
+          message: "Baseline P99 must be under 5 s"
+        - name: "degradation_ratio"
+          condition: "p99_degradation_ratio < 3.0"
+          message: "Stress-phase P99 must not exceed 3x baseline"
+
+    report:
+      title: "Mach5 Query Benchmark Report"
+      emphasis:
+        - "p99_degradation_ratio"
+        - "recovery_time"
+
+  images:
+    worker: "ghcr.io/mach5-io/worker:v0.1.0"
+    reporter: "ghcr.io/mach5-io/reporter:v0.1.0"
+
+  target:
+    adapter: "mach5"
+    config:
+      endpoint: "http://192.168.29.172:31950"   # ← microk8s node IP
+      namespace: "default"
+      warehouse:
+        name: "m1"
+        numMediators: 1
+        numOs: 1
+      pg_host: "192.168.29.172"                 # ← microk8s node IP
+      pg_port: 30685
+      pg_user: "mach5"
+      pg_password: "mach5"
+      pg_dbname: "default"
+
+  kafka:
+    managed: false
+    bootstrap_servers: ""
+
+  scaling:
+    duration_scale: 1.0
+    rate_scale: 1.0
+
+  workers:
+    query:
+      replicas: 4
+
+  dry_run: false

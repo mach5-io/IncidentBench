@@ -20,7 +20,8 @@ use incidentbench_common::adapters;
 use incidentbench_common::crd::{IncidentBenchRun, LifecyclePhase};
 use incidentbench_common::scenario::Scenario;
 use k8s_openapi::api::apps::v1::Deployment;
-use k8s_openapi::api::core::v1::{ConfigMap, Service};
+use k8s_openapi::api::batch::v1::Job;
+use k8s_openapi::api::core::v1::{ConfigMap, PersistentVolumeClaim, Service};
 use kube::api::{Patch, PatchParams};
 use kube::runtime::controller::{Action, Controller};
 use kube::runtime::watcher::Config;
@@ -175,7 +176,7 @@ async fn handle_pending(
                         "message": format!(
                             "Dry-run: scenario '{}' validated successfully. {} data streams, {} phases, total duration: {}s",
                             scenario.scenario.display_name,
-                            scenario.data_streams.len(),
+                            scenario.data_streams.as_deref().map_or(0, |s| s.len()),
                             scenario.timeline.phases.len(),
                             scenario.total_duration_seconds()
                         ),
@@ -279,8 +280,8 @@ async fn handle_preparing(
         .as_deref()
         .unwrap_or("kafka-bootstrap:9092");
 
-    // Create Kafka topics — one per data stream.
-    for stream in &scaled_scenario.data_streams {
+    // Create Kafka topics — one per data stream (skipped for query-only scenarios).
+    for stream in scaled_scenario.data_streams.as_deref().unwrap_or(&[]) {
         let topic = &stream.schema.index_name;
         let partitions = stream.kafka_partitions.unwrap_or(stream.ingest_replicas);
 
@@ -302,6 +303,8 @@ async fn handle_preparing(
     // Build DataStreamConfig list for the adapter.
     let stream_configs: Vec<DataStreamConfig> = scaled_scenario
         .data_streams
+        .as_deref()
+        .unwrap_or(&[])
         .iter()
         .map(|s| DataStreamConfig {
             name: s.name.clone(),
@@ -364,6 +367,8 @@ async fn handle_preparing(
             // Transition to Initializing.
             let stream_names: Vec<&str> = scaled_scenario
                 .data_streams
+                .as_deref()
+                .unwrap_or(&[])
                 .iter()
                 .map(|s| s.name.as_str())
                 .collect();
@@ -489,6 +494,18 @@ async fn handle_initializing(
         )
         .await;
 
+    // Create results PVC (persists after pod cleanup so the reporter can read files).
+    let pvc_api: Api<PersistentVolumeClaim> = Api::namespaced(ctx.client.clone(), &namespace);
+    let results_pvc = resources::build_results_pvc(&name, run);
+    let pvc_name = results_pvc.metadata.name.clone().unwrap_or_default();
+    let _ = pvc_api
+        .patch(
+            &pvc_name,
+            &PatchParams::apply("incidentbench-operator"),
+            &Patch::Apply(results_pvc),
+        )
+        .await;
+
     // Deploy MetricsAggregator.
     let agg_deploy = resources::build_aggregator_deployment(&name, spec, run);
     let agg_name = agg_deploy.metadata.name.clone().unwrap_or_default();
@@ -512,26 +529,56 @@ async fn handle_initializing(
         )
         .await;
 
-    // Deploy per-stream IngestWorker Deployments.
-    let ingest_deploys =
-        resources::build_ingest_stream_deployments(&name, &scaled_scenario, spec, run);
-    for deploy in &ingest_deploys {
-        let deploy_name = deploy.metadata.name.clone().unwrap_or_default();
-        let _ = deploy_api
-            .patch(
-                &deploy_name,
-                &PatchParams::apply("incidentbench-operator"),
-                &Patch::Apply(deploy.clone()),
-            )
-            .await;
+    // Build SQL files ConfigMap from sql_dir if specified, and apply it.
+    let sql_cm_name: Option<String> = spec
+        .sql_dir
+        .as_deref()
+        .filter(|d| !d.is_empty())
+        .and_then(|dir| resources::build_sql_files_configmap(&name, dir, run))
+        .map(|cm| {
+            let cm_name = cm.metadata.name.clone().unwrap_or_default();
+            let cm_api_clone = cm_api.clone();
+            let cm_name_clone = cm_name.clone();
+            tokio::spawn(async move {
+                let _ = cm_api_clone
+                    .patch(
+                        &cm_name_clone,
+                        &PatchParams::apply("incidentbench-operator"),
+                        &Patch::Apply(cm),
+                    )
+                    .await;
+            });
+            cm_name
+        });
+    let sql_cm_ref = sql_cm_name.as_deref();
+
+    // Deploy per-stream IngestWorker Deployments (skipped for query-only scenarios).
+    if scaled_scenario.has_ingest() {
+        let ingest_deploys =
+            resources::build_ingest_stream_deployments(&name, &scaled_scenario, spec, run);
+        for deploy in &ingest_deploys {
+            let deploy_name = deploy.metadata.name.clone().unwrap_or_default();
+            let _ = deploy_api
+                .patch(
+                    &deploy_name,
+                    &PatchParams::apply("incidentbench-operator"),
+                    &Patch::Apply(deploy.clone()),
+                )
+                .await;
+        }
     }
 
     // Deploy QueryWorker Deployment(s).
     let total_query_replicas: u32;
     if let Some(ref query_groups) = spec.workers.query_groups {
         total_query_replicas = query_groups.iter().map(|g| g.replicas).sum();
-        let group_deploys =
-            resources::build_query_worker_group_deployments(&name, query_groups, spec, run);
+        let group_deploys = resources::build_query_worker_group_deployments(
+            &name,
+            query_groups,
+            spec,
+            run,
+            sql_cm_ref,
+        );
         for deploy in group_deploys {
             let deploy_name = deploy.metadata.name.clone().unwrap_or_default();
             let _ = deploy_api
@@ -544,7 +591,7 @@ async fn handle_initializing(
         }
     } else {
         total_query_replicas = spec.workers.query.replicas;
-        let query_deploy = resources::build_query_worker_deployment(&name, spec, run);
+        let query_deploy = resources::build_query_worker_deployment(&name, spec, run, sql_cm_ref);
         let query_name = query_deploy.metadata.name.clone().unwrap_or_default();
         let _ = deploy_api
             .patch(
@@ -573,7 +620,7 @@ async fn handle_initializing(
                 "message": format!(
                     "{} ingest workers (across {} streams), {} query workers deployed",
                     total_ingest_replicas,
-                    scaled_scenario.data_streams.len(),
+                    scaled_scenario.data_streams.as_deref().map_or(0, |s| s.len()),
                     total_query_replicas
                 ),
                 "lastTransitionTime": chrono::Utc::now().to_rfc3339()
@@ -639,7 +686,7 @@ async fn handle_running(
                 if let Ok(scenario) = resolve_scenario(run, ctx).await {
                     let scaled = scenario
                         .with_scaling(run.spec.scaling.duration_scale, run.spec.scaling.rate_scale);
-                    for stream in &scaled.data_streams {
+                    for stream in scaled.data_streams.as_deref().unwrap_or(&[]) {
                         let deploy_name = format!("{}-ingest-{}", name, stream.name);
                         let scale_patch = serde_json::json!({
                             "spec": { "replicas": 0 }
@@ -852,8 +899,7 @@ async fn handle_aggregating(
         );
         serde_json::json!({
             "status": {
-                "phase": "Completed",
-                "completion_time": chrono::Utc::now().to_rfc3339(),
+                "phase": "Reporting",
                 "results": {
                     "valid": results.valid,
                     "validity_violations": results.validity_violations,
@@ -868,25 +914,14 @@ async fn handle_aggregating(
                         "backlog_drain_time_s": results.backlog_drain_time_s,
                         "recovery_time_s": results.recovery_time_s
                     }
-                },
-                "conditions": [{
-                    "type": "RunComplete",
-                    "status": "True",
-                    "message": format!(
-                        "Run completed. Valid: {}. Baseline P99: {:.1}ms, Overlap P99: {:.1}ms, Degradation: {:.2}x",
-                        results.valid, results.baseline_p99_ms, results.overlap_p99_ms, results.p99_degradation_ratio
-                    ),
-                    "lastTransitionTime": chrono::Utc::now().to_rfc3339()
-                }]
+                }
             }
         })
     } else {
-        // Aggregator returned an error (e.g. timeout path or not in complete state).
-        warn!(name = %name, "Could not fetch results from aggregator, completing with empty results");
+        warn!(name = %name, "Could not fetch results from aggregator, proceeding to Reporting with empty results");
         serde_json::json!({
             "status": {
-                "phase": "Completed",
-                "completion_time": chrono::Utc::now().to_rfc3339(),
+                "phase": "Reporting",
                 "results": {
                     "valid": false,
                     "validity_violations": ["No metrics data collected from workers"],
@@ -901,13 +936,7 @@ async fn handle_aggregating(
                         "backlog_drain_time_s": 0.0,
                         "recovery_time_s": 0.0
                     }
-                },
-                "conditions": [{
-                    "type": "RunComplete",
-                    "status": "True",
-                    "message": "Run completed with no metrics data (workers may have failed to connect to aggregator)",
-                    "lastTransitionTime": chrono::Utc::now().to_rfc3339()
-                }]
+                }
             }
         })
     };
@@ -918,38 +947,83 @@ async fn handle_aggregating(
     )
     .await?;
 
-    info!(name = %name, "Results written to CR, transitioning to Completed");
+    info!(name = %name, "Results written to CR, transitioning to Reporting");
     Ok(())
 }
 
-/// Reporting: Legacy fallback — transition directly to Completed.
+/// Reporting: create the reporter Job and wait for it to complete.
 async fn handle_reporting(
     api: &Api<IncidentBenchRun>,
     run: &IncidentBenchRun,
-    _ctx: &Ctx,
+    ctx: &Ctx,
 ) -> Result<(), kube::Error> {
     let name = run.name_any();
+    let ns = run.namespace().unwrap_or_default();
+    let job_name = format!("{}-reporter", name);
+    let jobs: Api<Job> = Api::namespaced(ctx.client.clone(), &ns);
 
-    let status = serde_json::json!({
-        "status": {
-            "phase": "Completed",
-            "completion_time": chrono::Utc::now().to_rfc3339(),
-            "conditions": [{
-                "type": "RunComplete",
-                "status": "True",
-                "message": "Run completed (legacy Reporting phase — results may not be populated)",
-                "lastTransitionTime": chrono::Utc::now().to_rfc3339()
-            }]
+    // Create the reporter Job if it doesn't exist yet.
+    match jobs.get(&job_name).await {
+        Err(kube::Error::Api(e)) if e.code == 404 => {
+            let job = resources::build_reporter_job(&name, run);
+            jobs.create(&kube::api::PostParams::default(), &job).await?;
+            info!(name = %name, job = %job_name, "Reporter job created");
         }
-    });
-    api.patch_status(
-        &name,
-        &PatchParams::apply("incidentbench-operator"),
-        &Patch::Merge(&status),
-    )
-    .await?;
+        Err(e) => return Err(e),
+        Ok(_) => {}
+    }
 
-    info!(name = %name, "Legacy Reporting phase, transitioning to Completed");
+    // Check whether the Job has finished.
+    let job = jobs.get(&job_name).await?;
+    let succeeded = job.status.as_ref().and_then(|s| s.succeeded).unwrap_or(0);
+    let failed = job.status.as_ref().and_then(|s| s.failed).unwrap_or(0);
+
+    if succeeded > 0 {
+        let now = chrono::Utc::now().to_rfc3339();
+        let status = serde_json::json!({
+            "status": {
+                "phase": "Completed",
+                "completion_time": &now,
+                "conditions": [{
+                    "type": "RunComplete",
+                    "status": "True",
+                    "message": "Reporter job finished — report.html, run.json, timeseries.csv written to results PVC",
+                    "lastTransitionTime": &now
+                }]
+            }
+        });
+        api.patch_status(
+            &name,
+            &PatchParams::apply("incidentbench-operator"),
+            &Patch::Merge(&status),
+        )
+        .await?;
+        info!(name = %name, "Reporter job complete, run Completed");
+    } else if failed >= 3 {
+        let now = chrono::Utc::now().to_rfc3339();
+        let status = serde_json::json!({
+            "status": {
+                "phase": "Completed",
+                "completion_time": &now,
+                "conditions": [{
+                    "type": "RunComplete",
+                    "status": "True",
+                    "message": "Reporter job failed — raw metrics in PVC, re-run with: incidentbench report regenerate",
+                    "lastTransitionTime": &now
+                }]
+            }
+        });
+        api.patch_status(
+            &name,
+            &PatchParams::apply("incidentbench-operator"),
+            &Patch::Merge(&status),
+        )
+        .await?;
+        warn!(name = %name, "Reporter job failed, transitioning to Completed anyway");
+    } else {
+        info!(name = %name, "Waiting for reporter job to complete");
+    }
+
     Ok(())
 }
 
@@ -981,7 +1055,7 @@ async fn handle_cleanup(
 
     // Delete per-stream ingest deployments.
     if let Some(scenario) = &spec.scenario {
-        for stream in &scenario.data_streams {
+        for stream in scenario.data_streams.as_deref().unwrap_or(&[]) {
             let deploy_name = format!("{}-ingest-{}", name, stream.name);
             match deploy_api.delete(&deploy_name, &Default::default()).await {
                 Ok(_) => info!(name = %name, "Deleted deployment {}", deploy_name),
@@ -1033,7 +1107,7 @@ async fn handle_cleanup(
     }
     // Per-stream ingest configmaps.
     if let Some(scenario) = &spec.scenario {
-        for stream in &scenario.data_streams {
+        for stream in scenario.data_streams.as_deref().unwrap_or(&[]) {
             let cm_name = format!("{}-ingest-{}", name, stream.name);
             match cm_api.delete(&cm_name, &Default::default()).await {
                 Ok(_) => info!(name = %name, "Deleted configmap {}", cm_name),
@@ -1060,6 +1134,8 @@ async fn handle_cleanup(
             let warehouses = build_warehouse_configs(spec);
             let stream_configs: Vec<DataStreamConfig> = scenario
                 .data_streams
+                .as_deref()
+                .unwrap_or(&[])
                 .iter()
                 .map(|s| DataStreamConfig {
                     name: s.name.clone(),
@@ -1082,7 +1158,7 @@ async fn handle_cleanup(
             .bootstrap_servers
             .as_deref()
             .unwrap_or("kafka-bootstrap:9092");
-        for stream in &scenario.data_streams {
+        for stream in scenario.data_streams.as_deref().unwrap_or(&[]) {
             if let Err(e) = delete_kafka_topic(kafka_bootstrap, &stream.schema.index_name).await {
                 warn!(name = %name, "Kafka topic deletion failed for '{}': {}", stream.schema.index_name, e);
             }
@@ -1318,7 +1394,7 @@ async fn check_worker_health(
     if let Ok(scenario) = resolve_scenario(run, ctx).await {
         let scaled =
             scenario.with_scaling(run.spec.scaling.duration_scale, run.spec.scaling.rate_scale);
-        for stream in &scaled.data_streams {
+        for stream in scaled.data_streams.as_deref().unwrap_or(&[]) {
             check_deployment_health(deploy_api, &format!("{}-ingest-{}", name, stream.name))
                 .await?;
         }

@@ -165,6 +165,8 @@ pub async fn run(config_path: &str) -> anyhow::Result<()> {
                 cpu_utilization: proc_cpu,
                 memory_bytes: proc_mem as i64,
                 target_rate: current_rate as i64,
+                concurrent_sessions: 0,
+                timed_out_queries: vec![],
             };
 
             if let Err(e) = metrics_tx.try_send(snapshot) {

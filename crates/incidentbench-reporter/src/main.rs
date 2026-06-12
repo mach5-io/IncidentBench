@@ -16,7 +16,7 @@ mod html_report;
 mod json_report;
 
 use clap::Parser;
-use incidentbench_common::metrics::{compute_derived, TimeSeries};
+use incidentbench_common::metrics::{compute_derived, PerQueryTimeSeries, TimeSeries};
 use incidentbench_common::scenario::Scenario;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -53,6 +53,33 @@ async fn main() -> anyhow::Result<()> {
     let scenario_str = tokio::fs::read_to_string(&scenario_path).await?;
     let scenario: Scenario = serde_yaml::from_str(&scenario_str)?;
 
+    // Optionally load timed-out query records written by the aggregator.
+    let timeouts_path = format!("{}/timed_out_queries.json", cli.input);
+    let timed_out_queries: Vec<serde_json::Value> =
+        if let Ok(s) = tokio::fs::read_to_string(&timeouts_path).await {
+            serde_json::from_str(&s).unwrap_or_default()
+        } else {
+            vec![]
+        };
+
+    // Optionally load per-query latency summary written by the aggregator.
+    let per_query_path = format!("{}/per_query_latency.json", cli.input);
+    let per_query_latency: Vec<serde_json::Value> =
+        if let Ok(s) = tokio::fs::read_to_string(&per_query_path).await {
+            serde_json::from_str(&s).unwrap_or_default()
+        } else {
+            vec![]
+        };
+    let per_query_timeseries_path = format!("{}/per_query_timeseries.json", cli.input);
+    let per_query_timeseries: Vec<PerQueryTimeSeries> =
+        if let Ok(s) = tokio::fs::read_to_string(&per_query_timeseries_path).await {
+            serde_json::from_str(&s).unwrap_or_default()
+        } else {
+            vec![]
+        };
+    let per_category_latency =
+        json_report::build_per_category_latency(&scenario, &timed_out_queries, &per_query_latency);
+
     // Compute derived metrics.
     let derived = compute_derived(&timeseries);
     let scorecard = incidentbench_common::metrics::Scorecard::from_derived(&derived);
@@ -60,14 +87,32 @@ async fn main() -> anyhow::Result<()> {
     info!(?scorecard, "Scorecard computed");
 
     // Generate JSON report.
-    let json_report = json_report::generate(&scenario, &timeseries, &derived, &scorecard)?;
+    let json_report = json_report::generate(
+        &scenario,
+        &timeseries,
+        &derived,
+        &scorecard,
+        &timed_out_queries,
+        &per_category_latency,
+        &per_query_latency,
+        &per_query_timeseries,
+    )?;
     let json_path = format!("{}/run.json", cli.output);
     tokio::fs::create_dir_all(&cli.output).await?;
     tokio::fs::write(&json_path, &json_report).await?;
     info!(path = %json_path, "JSON report written");
 
     // Generate HTML report.
-    let html_report = html_report::generate(&scenario, &timeseries, &derived, &scorecard)?;
+    let html_report = html_report::generate(
+        &scenario,
+        &timeseries,
+        &derived,
+        &scorecard,
+        &timed_out_queries,
+        &per_category_latency,
+        &per_query_latency,
+        &per_query_timeseries,
+    )?;
     let html_path = format!("{}/report.html", cli.output);
     tokio::fs::write(&html_path, &html_report).await?;
     info!(path = %html_path, "HTML report written");
@@ -77,6 +122,38 @@ async fn main() -> anyhow::Result<()> {
     let csv_content = generate_csv(&timeseries);
     tokio::fs::write(&csv_path, &csv_content).await?;
     info!(path = %csv_path, "Timeseries CSV written");
+
+    let copied_timeouts_path = format!("{}/timed_out_queries.json", cli.output);
+    tokio::fs::write(
+        &copied_timeouts_path,
+        serde_json::to_string_pretty(&timed_out_queries)?,
+    )
+    .await?;
+    info!(path = %copied_timeouts_path, "Timed-out queries JSON written");
+
+    let copied_per_query_path = format!("{}/per_query_latency.json", cli.output);
+    tokio::fs::write(
+        &copied_per_query_path,
+        serde_json::to_string_pretty(&per_query_latency)?,
+    )
+    .await?;
+    info!(path = %copied_per_query_path, "Per-query latency JSON written");
+
+    let copied_per_category_path = format!("{}/per_category_latency.json", cli.output);
+    tokio::fs::write(
+        &copied_per_category_path,
+        serde_json::to_string_pretty(&per_category_latency)?,
+    )
+    .await?;
+    info!(path = %copied_per_category_path, "Per-category latency JSON written");
+
+    let copied_per_query_timeseries_path = format!("{}/per_query_timeseries.json", cli.output);
+    tokio::fs::write(
+        &copied_per_query_timeseries_path,
+        serde_json::to_string_pretty(&per_query_timeseries)?,
+    )
+    .await?;
+    info!(path = %copied_per_query_timeseries_path, "Per-query timeseries JSON written");
 
     info!("Report generation complete");
     Ok(())

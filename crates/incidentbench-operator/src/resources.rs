@@ -15,9 +15,10 @@
 use incidentbench_common::crd::{
     IncidentBenchRun, IncidentBenchRunSpec, QueryGroupSpec, ResourceSpec,
 };
-use incidentbench_common::scenario::Scenario;
+use incidentbench_common::scenario::{IterationMode, QueryCategory, QuerySession, Scenario};
 use k8s_openapi::api::apps::v1::Deployment;
-use k8s_openapi::api::core::v1::{ConfigMap, Service};
+use k8s_openapi::api::batch::v1::Job;
+use k8s_openapi::api::core::v1::{ConfigMap, PersistentVolumeClaim, Service};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use kube::Resource;
 use std::collections::{BTreeMap, HashMap};
@@ -108,6 +109,72 @@ pub fn build_prepare_result_configmap(
         data: Some(data),
         ..Default::default()
     }
+}
+
+/// Build a ConfigMap containing all SQL files found under `sql_dir`.
+///
+/// Each file at `{sql_dir}/{category}/{filename}.sql` is stored under the key
+/// `{category}_{filename}.sql` (slash replaced with underscore, since ConfigMap
+/// keys may not contain `/`). Query workers mount this ConfigMap at `/queries/`
+/// and read files by the same key mapping.
+///
+/// Returns `None` when `sql_dir` is not set or is empty.
+pub fn build_sql_files_configmap(
+    run_name: &str,
+    sql_dir: &str,
+    run: &IncidentBenchRun,
+) -> Option<ConfigMap> {
+    if sql_dir.is_empty() {
+        return None;
+    }
+
+    let mut data = BTreeMap::new();
+
+    // Walk sql_dir recursively and collect .sql files.
+    fn walk(dir: &std::path::Path, root: &std::path::Path, data: &mut BTreeMap<String, String>) {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, root, data);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("sql") {
+                let relative = path.strip_prefix(root).unwrap_or(&path);
+                // Convert "basic-search/01-query.sql" → "basic-search_01-query.sql"
+                let key = relative
+                    .to_string_lossy()
+                    .replace('/', "_")
+                    .replace('\\', "_");
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    data.insert(key, content);
+                }
+            }
+        }
+    }
+
+    walk(
+        std::path::Path::new(sql_dir),
+        std::path::Path::new(sql_dir),
+        &mut data,
+    );
+
+    if data.is_empty() {
+        return None;
+    }
+
+    Some(ConfigMap {
+        metadata: k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
+            name: Some(format!("{}-sql-files", run_name)),
+            namespace: run.metadata.namespace.clone(),
+            owner_references: Some(vec![owner_reference(run)]),
+            labels: Some(standard_labels(run_name, "sql-files")),
+            ..Default::default()
+        },
+        data: Some(data),
+        ..Default::default()
+    })
 }
 
 /// Build ConfigMaps for worker configuration.
@@ -203,6 +270,8 @@ pub fn build_worker_configmaps(
     // Aggregator config — multi-stream lag polling.
     let agg_streams: Vec<serde_json::Value> = scenario
         .data_streams
+        .as_deref()
+        .unwrap_or(&[])
         .iter()
         .map(|stream| {
             let cg = consumer_groups
@@ -219,7 +288,7 @@ pub fn build_worker_configmaps(
     let agg_config = serde_json::json!({
         "kafka_bootstrap_servers": kafka_bootstrap_servers,
         "streams": agg_streams,
-        "results_path": "/tmp/results"
+        "results_path": "/results"
     });
     let mut data = BTreeMap::new();
     data.insert(
@@ -239,7 +308,7 @@ pub fn build_worker_configmaps(
     });
 
     // Per-stream ingest worker configs.
-    for stream in &scenario.data_streams {
+    for stream in scenario.data_streams.as_deref().unwrap_or(&[]) {
         let rate_table = scenario.compute_ingest_rate_table(stream, 0);
         let ingest_config = serde_json::json!({
             "worker_index": 0,
@@ -269,6 +338,10 @@ pub fn build_worker_configmaps(
         });
     }
 
+    // Derive effective query_session: either explicit from scenario YAML, or
+    // auto-built from query_mix when all queries carry a category field.
+    let effective_session = derive_query_session(scenario);
+
     // Query worker config.
     let first_endpoint = query_endpoints.values().next().cloned().unwrap_or_default();
     let query_rate_table = scenario.compute_query_rate_table(total_query_replicas, 0);
@@ -282,7 +355,9 @@ pub fn build_worker_configmaps(
         "target_adapter": &spec.target.adapter,
         "target_config": &spec.target.config,
         "phase_controller_addr": &pc_addr,
-        "aggregator_addr": &agg_addr
+        "aggregator_addr": &agg_addr,
+        "query_session": &effective_session,
+        "default_timeout_ms": scenario.default_timeout_ms
     });
     let mut data = BTreeMap::new();
     data.insert(
@@ -330,7 +405,9 @@ pub fn build_worker_configmaps(
                 "target_adapter": &spec.target.adapter,
                 "target_config": &spec.target.config,
                 "phase_controller_addr": &pc_addr,
-                "aggregator_addr": &agg_addr
+                "aggregator_addr": &agg_addr,
+                "query_session": &effective_session,
+                "default_timeout_ms": scenario.default_timeout_ms
             });
             let mut data = BTreeMap::new();
             data.insert(
@@ -355,6 +432,26 @@ pub fn build_worker_configmaps(
 }
 
 /// Build the MetricsAggregator Deployment.
+/// Build a PVC for results storage. Named `{run_name}-results`.
+pub fn build_results_pvc(run_name: &str, run: &IncidentBenchRun) -> PersistentVolumeClaim {
+    serde_json::from_value(serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "PersistentVolumeClaim",
+        "metadata": {
+            "name": format!("{}-results", run_name),
+            "namespace": run.metadata.namespace,
+            "labels": standard_labels(run_name, "results")
+        },
+        "spec": {
+            "accessModes": ["ReadWriteOnce"],
+            "resources": {
+                "requests": { "storage": "1Gi" }
+            }
+        }
+    }))
+    .expect("valid PVC JSON")
+}
+
 pub fn build_aggregator_deployment(
     run_name: &str,
     spec: &IncidentBenchRunSpec,
@@ -394,7 +491,7 @@ pub fn build_aggregator_deployment(
                     "containers": [{
                         "name": "aggregator",
                         "image": image,
-                        "imagePullPolicy": "Always",
+                        "imagePullPolicy": "IfNotPresent",
                         "command": ["incidentbench-worker", "aggregator", "--config", "/config/aggregator.yaml"],
                         "ports": [{ "containerPort": 50052 }, { "containerPort": 8080, "name": "health" }],
                         "livenessProbe": {
@@ -407,17 +504,36 @@ pub fn build_aggregator_deployment(
                             "initialDelaySeconds": 3,
                             "periodSeconds": 5
                         },
-                        "volumeMounts": [{
-                            "name": "config",
-                            "mountPath": "/config"
-                        }]
+                        "volumeMounts": [
+                            { "name": "config", "mountPath": "/config" },
+                            { "name": "results", "mountPath": "/results" },
+                            { "name": "scenario", "mountPath": "/scenario" }
+                        ]
                     }],
-                    "volumes": [{
-                        "name": "config",
-                        "configMap": {
-                            "name": format!("{}-aggregator", run_name)
+                    "initContainers": [{
+                        "name": "copy-scenario",
+                        "image": "busybox:1.36",
+                        "imagePullPolicy": "IfNotPresent",
+                        "command": ["sh", "-c", "cp /scenario/scenario.yaml /results/scenario.yaml"],
+                        "volumeMounts": [
+                            { "name": "scenario", "mountPath": "/scenario" },
+                            { "name": "results", "mountPath": "/results" }
+                        ]
+                    }],
+                    "volumes": [
+                        {
+                            "name": "config",
+                            "configMap": { "name": format!("{}-aggregator", run_name) }
+                        },
+                        {
+                            "name": "results",
+                            "persistentVolumeClaim": { "claimName": format!("{}-results", run_name) }
+                        },
+                        {
+                            "name": "scenario",
+                            "configMap": { "name": format!("{}-scenario", run_name) }
                         }
-                    }]
+                    ]
                 }
             }
         }
@@ -522,7 +638,7 @@ pub fn build_phase_controller_deployment(
                     "containers": [{
                         "name": "phase-controller",
                         "image": image,
-                        "imagePullPolicy": "Always",
+                        "imagePullPolicy": "IfNotPresent",
                         "command": ["incidentbench-worker", "phase-controller", "--config", "/config/phase-controller.yaml"],
                         "ports": [{ "containerPort": 50051 }, { "containerPort": 8080, "name": "health" }],
                         "livenessProbe": {
@@ -571,6 +687,8 @@ pub fn build_ingest_stream_deployments(
 
     scenario
         .data_streams
+        .as_deref()
+        .unwrap_or(&[])
         .iter()
         .map(|stream| {
             let mut labels = standard_labels(run_name, "ingest-worker");
@@ -605,7 +723,7 @@ pub fn build_ingest_stream_deployments(
                             "containers": [{
                                 "name": "ingest-worker",
                                 "image": image,
-                                "imagePullPolicy": "Always",
+                                "imagePullPolicy": "IfNotPresent",
                                 "command": ["incidentbench-worker", "ingest", "--config", "/config/ingest.yaml"],
                                 "env": [{
                                     "name": "POD_NAME",
@@ -648,10 +766,12 @@ pub fn build_ingest_stream_deployments(
 }
 
 /// Build the QueryWorker Deployment.
+/// `sql_cm_name`: if Some, adds a `/queries/` volume mount from that ConfigMap.
 pub fn build_query_worker_deployment(
     run_name: &str,
     spec: &IncidentBenchRunSpec,
     run: &IncidentBenchRun,
+    sql_cm_name: Option<&str>,
 ) -> Deployment {
     let image = spec
         .images
@@ -661,6 +781,26 @@ pub fn build_query_worker_deployment(
         .unwrap_or_else(|| "ghcr.io/mach5-io/incidentbench-worker:v0.1.0".to_string());
 
     let labels = standard_labels(run_name, "query-worker");
+
+    let mut volume_mounts = vec![serde_json::json!({
+        "name": "config",
+        "mountPath": "/config"
+    })];
+    let mut volumes = vec![serde_json::json!({
+        "name": "config",
+        "configMap": { "name": format!("{}-query", run_name) }
+    })];
+
+    if let Some(cm) = sql_cm_name {
+        volume_mounts.push(serde_json::json!({
+            "name": "sql-files",
+            "mountPath": "/queries"
+        }));
+        volumes.push(serde_json::json!({
+            "name": "sql-files",
+            "configMap": { "name": cm }
+        }));
+    }
 
     serde_json::from_value(serde_json::json!({
         "apiVersion": "apps/v1",
@@ -680,22 +820,16 @@ pub fn build_query_worker_deployment(
                 }
             },
             "template": {
-                "metadata": {
-                    "labels": labels
-                },
+                "metadata": { "labels": labels },
                 "spec": {
                     "containers": [{
                         "name": "query-worker",
                         "image": image,
-                        "imagePullPolicy": "Always",
+                        "imagePullPolicy": "IfNotPresent",
                         "command": ["incidentbench-worker", "query", "--config", "/config/query.yaml"],
                         "env": [{
                             "name": "POD_NAME",
-                            "valueFrom": {
-                                "fieldRef": {
-                                    "fieldPath": "metadata.name"
-                                }
-                            }
+                            "valueFrom": { "fieldRef": { "fieldPath": "metadata.name" } }
                         }],
                         "ports": [{ "containerPort": 8080, "name": "health" }],
                         "livenessProbe": {
@@ -708,18 +842,10 @@ pub fn build_query_worker_deployment(
                             "initialDelaySeconds": 3,
                             "periodSeconds": 5
                         },
-                        "volumeMounts": [{
-                            "name": "config",
-                            "mountPath": "/config"
-                        }],
+                        "volumeMounts": volume_mounts,
                         "resources": resolve_resources(&spec.workers.query.resources)
                     }],
-                    "volumes": [{
-                        "name": "config",
-                        "configMap": {
-                            "name": format!("{}-query", run_name)
-                        }
-                    }]
+                    "volumes": volumes
                 }
             }
         }
@@ -728,11 +854,13 @@ pub fn build_query_worker_deployment(
 }
 
 /// Build one QueryWorker Deployment per query group (multi-warehouse mode).
+/// `sql_cm_name`: if Some, adds a `/queries/` volume mount from that ConfigMap.
 pub fn build_query_worker_group_deployments(
     run_name: &str,
     query_groups: &[QueryGroupSpec],
     spec: &IncidentBenchRunSpec,
     run: &IncidentBenchRun,
+    sql_cm_name: Option<&str>,
 ) -> Vec<Deployment> {
     let image = spec
         .images
@@ -749,6 +877,25 @@ pub fn build_query_worker_group_deployments(
                 "incidentbench.io/query-group".to_string(),
                 group.name.clone(),
             );
+
+            let mut volume_mounts = vec![serde_json::json!({
+                "name": "config",
+                "mountPath": "/config"
+            })];
+            let mut volumes = vec![serde_json::json!({
+                "name": "config",
+                "configMap": { "name": format!("{}-query-{}", run_name, group.name) }
+            })];
+            if let Some(cm) = sql_cm_name {
+                volume_mounts.push(serde_json::json!({
+                    "name": "sql-files",
+                    "mountPath": "/queries"
+                }));
+                volumes.push(serde_json::json!({
+                    "name": "sql-files",
+                    "configMap": { "name": cm }
+                }));
+            }
 
             serde_json::from_value(serde_json::json!({
                 "apiVersion": "apps/v1",
@@ -769,25 +916,19 @@ pub fn build_query_worker_group_deployments(
                         }
                     },
                     "template": {
-                        "metadata": {
-                            "labels": labels
-                        },
+                        "metadata": { "labels": labels },
                         "spec": {
                             "containers": [{
                                 "name": "query-worker",
                                 "image": image,
-                                "imagePullPolicy": "Always",
+                                "imagePullPolicy": "IfNotPresent",
                                 "command": [
                                     "incidentbench-worker", "query",
                                     "--config", format!("/config/query-{}.yaml", group.name)
                                 ],
                                 "env": [{
                                     "name": "POD_NAME",
-                                    "valueFrom": {
-                                        "fieldRef": {
-                                            "fieldPath": "metadata.name"
-                                        }
-                                    }
+                                    "valueFrom": { "fieldRef": { "fieldPath": "metadata.name" } }
                                 }],
                                 "ports": [{ "containerPort": 8080, "name": "health" }],
                                 "livenessProbe": {
@@ -800,18 +941,10 @@ pub fn build_query_worker_group_deployments(
                                     "initialDelaySeconds": 3,
                                     "periodSeconds": 5
                                 },
-                                "volumeMounts": [{
-                                    "name": "config",
-                                    "mountPath": "/config"
-                                }],
+                                "volumeMounts": volume_mounts,
                                 "resources": resolve_resources(&group.resources)
                             }],
-                            "volumes": [{
-                                "name": "config",
-                                "configMap": {
-                                    "name": format!("{}-query-{}", run_name, group.name)
-                                }
-                            }]
+                            "volumes": volumes
                         }
                     }
                 }
@@ -819,4 +952,104 @@ pub fn build_query_worker_group_deployments(
             .expect("valid deployment JSON")
         })
         .collect()
+}
+
+/// Derive the effective QuerySession for worker config.
+///
+/// Priority:
+///   1. Explicit `scenario.query_session` — used as-is.
+///   2. Auto-detect from `query_mix`: when every query has a `category`, group
+///      them by category (insertion order preserved) and return a QuerySession
+///      with sequential round-robin iteration and parallelism=1.
+///   3. Neither — returns None (worker uses rate-controlled weighted-random mode).
+fn derive_query_session(scenario: &Scenario) -> Option<QuerySession> {
+    if let Some(ref qs) = scenario.query_session {
+        return Some(qs.clone());
+    }
+
+    if !scenario.is_session_mode() {
+        return None;
+    }
+
+    // Group query_mix queries by category, preserving first-seen insertion order.
+    let mut order: Vec<String> = Vec::new();
+    let mut groups: HashMap<String, Vec<incidentbench_common::scenario::QueryDef>> = HashMap::new();
+    for q in &scenario.query_mix.queries {
+        let cat = q.category.as_deref().unwrap_or("default").to_string();
+        if !groups.contains_key(&cat) {
+            order.push(cat.clone());
+        }
+        groups.entry(cat).or_default().push(q.clone());
+    }
+
+    let categories: Vec<QueryCategory> = order
+        .into_iter()
+        .map(|name| QueryCategory {
+            queries: groups.remove(&name).unwrap_or_default(),
+            name,
+            iteration: IterationMode::Sequential,
+            parallelism: 1,
+        })
+        .collect();
+
+    Some(QuerySession {
+        categories,
+        think_time_ms: 0,
+    })
+}
+
+/// Build a reporter Job that reads metrics from the results PVC and writes
+/// report.html, run.json, and timeseries.csv back to the same PVC.
+pub fn build_reporter_job(run_name: &str, run: &IncidentBenchRun) -> Job {
+    let spec = &run.spec;
+    let image = spec
+        .images
+        .as_ref()
+        .and_then(|i| i.reporter.as_ref())
+        .cloned()
+        .unwrap_or_else(|| "ghcr.io/mach5-io/incidentbench-reporter:v0.1.0".to_string());
+
+    let labels = standard_labels(run_name, "reporter");
+
+    serde_json::from_value(serde_json::json!({
+        "apiVersion": "batch/v1",
+        "kind": "Job",
+        "metadata": {
+            "name": format!("{}-reporter", run_name),
+            "namespace": run.metadata.namespace,
+            "ownerReferences": [owner_reference(run)],
+            "labels": labels
+        },
+        "spec": {
+            "backoffLimit": 2,
+            "ttlSecondsAfterFinished": 600,
+            "template": {
+                "metadata": { "labels": labels },
+                "spec": {
+                    "restartPolicy": "OnFailure",
+                    "containers": [{
+                        "name": "reporter",
+                        "image": image,
+                        "imagePullPolicy": "IfNotPresent",
+                        "command": [
+                            "incidentbench-reporter",
+                            "--input", "/results",
+                            "--output", "/results"
+                        ],
+                        "volumeMounts": [{
+                            "name": "results",
+                            "mountPath": "/results"
+                        }]
+                    }],
+                    "volumes": [{
+                        "name": "results",
+                        "persistentVolumeClaim": {
+                            "claimName": format!("{}-results", run_name)
+                        }
+                    }]
+                }
+            }
+        }
+    }))
+    .expect("valid reporter Job JSON")
 }

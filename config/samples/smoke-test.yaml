@@ -112,14 +112,12 @@ spec:
       queries:
         - name: "error_search"
           type: search
-          weight: 0.3
           template: "level:ERROR"
           index: "incidentbench-smoke"
           timeout_ms: 10000
           description: "Search for errors in app logs"
         - name: "all_logs"
           type: search
-          weight: 0.3
           template: "*"
           index: "incidentbench-smoke"
           timeout_ms: 10000
@@ -127,14 +125,12 @@ spec:
           description: "Recent app logs"
         - name: "auth_failures"
           type: search
-          weight: 0.2
           template: "event_type:login_failure"
           index: "incidentbench-security"
           timeout_ms: 10000
           description: "Search for failed logins"
         - name: "priv_escalation"
           type: search
-          weight: 0.2
           template: "event_type:privilege_escalation"
           index: "incidentbench-security"
           timeout_ms: 10000

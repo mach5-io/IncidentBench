@@ -194,14 +194,12 @@ query_mix:
   queries:
     - name: "error_search"
       type: search
-      weight: 0.25
       template: "level:ERROR AND service:payment-service"
       timeout_ms: 10000
       description: "Search for errors in the failing service"
 
     - name: "recent_errors"
       type: search
-      weight: 0.15
       template: "level:ERROR"
       sort: "@timestamp:desc"
       limit: 100
@@ -210,7 +208,6 @@ query_mix:
 
     - name: "error_code_agg"
       type: aggregation
-      weight: 0.15
       template: |
         filter: level:ERROR
         aggregate: terms(error_code)
@@ -219,7 +216,6 @@ query_mix:
 
     - name: "service_error_rate"
       type: aggregation
-      weight: 0.15
       template: |
         filter: *
         aggregate: terms(service) > terms(level)
@@ -228,7 +224,6 @@ query_mix:
 
     - name: "trace_lookup"
       type: search
-      weight: 0.10
       template: "trace_id:{{random_trace_id}}"
       timeout_ms: 10000
       description: "Look up a specific trace"
@@ -238,7 +233,6 @@ query_mix:
 
     - name: "status_code_timeline"
       type: aggregation
-      weight: 0.10
       template: |
         filter: service:payment-service
         aggregate: date_histogram(@timestamp, interval=1m) > terms(http_status)
@@ -247,14 +241,12 @@ query_mix:
 
     - name: "slow_requests"
       type: search
-      weight: 0.05
       template: "response_time_ms:>5000 AND service:payment-service"
       timeout_ms: 10000
       description: "Find slow requests in the failing service"
 
     - name: "wildcard_message"
       type: search
-      weight: 0.05
       template: "message:*NullPointerException*"
       timeout_ms: 15000
       description: "Wildcard search for specific exception"

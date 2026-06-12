@@ -76,7 +76,7 @@ pub async fn execute(
     println!();
 
     println!("Data Streams:");
-    for stream in &scaled.data_streams {
+    for stream in scaled.data_streams.as_deref().unwrap_or(&[]) {
         println!(
             "  {} (index: {}, replicas: {})",
             stream.name, stream.schema.index_name, stream.ingest_replicas
@@ -89,6 +89,8 @@ pub async fn execute(
         // Sum target EPS across all data streams for this phase.
         let phase_total_eps: u64 = scaled
             .data_streams
+            .as_deref()
+            .unwrap_or(&[])
             .iter()
             .map(|s| s.ingest.get(&phase.name).map(|i| i.target_eps).unwrap_or(0))
             .sum();
@@ -104,10 +106,26 @@ pub async fn execute(
         return Ok(());
     }
 
-    // Build CR name from scenario name.
+    // Build CR name from scenario name — must be RFC 1123 lowercase DNS subdomain.
+    let sanitized_name: String = scenario
+        .scenario
+        .name
+        .to_lowercase()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '.' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let sanitized_name = sanitized_name
+        .trim_matches(|c| c == '-' || c == '.')
+        .to_string();
     let run_name = format!(
         "{}-{}",
-        scenario.scenario.name,
+        sanitized_name,
         chrono::Utc::now().format("%Y%m%d-%H%M%S")
     );
 
@@ -172,8 +190,11 @@ pub async fn validate(scenario_path: &str) -> anyhow::Result<()> {
         println!();
         println!("  Version:    {}", scenario.scenario.version);
         println!("  Domain:     {}", scenario.scenario.domain);
-        println!("  Streams:    {}", scenario.data_streams.len());
-        for stream in &scenario.data_streams {
+        println!(
+            "  Streams:    {}",
+            scenario.data_streams.as_deref().map_or(0, |s| s.len())
+        );
+        for stream in scenario.data_streams.as_deref().unwrap_or(&[]) {
             println!(
                 "    {} -> index '{}' ({} fields)",
                 stream.name,

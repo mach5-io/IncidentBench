@@ -12,61 +12,139 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use incidentbench_common::crd::IncidentBenchRun;
+use incidentbench_common::crd::{IncidentBenchRun, LifecyclePhase};
 use kube::{Api, Client};
+use tokio::io::AsyncWriteExt;
 
 /// Download report files from a completed run.
+///
+/// Spins up a short-lived pod that mounts the results PVC, copies report.html,
+/// run.json, timeseries.csv, and the raw latency/timeout JSON files to the
+/// local output directory via kubectl cp, then removes the pod.
 pub async fn download(run_name: &str, namespace: &str, output_dir: &str) -> anyhow::Result<()> {
+    use tokio::process::Command;
+
     let client = Client::try_default().await?;
     let api: Api<IncidentBenchRun> = Api::namespaced(client, namespace);
 
     let run = api.get(run_name).await?;
-    let status = run
+    let phase = run
         .status
         .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("Run has no status"))?;
+        .map(|s| s.phase.clone())
+        .unwrap_or_default();
 
-    let results = status
-        .results
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("Run has no results — is it completed?"))?;
+    if phase != LifecyclePhase::Completed {
+        anyhow::bail!("Run is not Completed yet (current phase: {})", phase);
+    }
 
-    println!("Run: {}/{}", namespace, run_name);
-    println!("Valid: {}", results.valid);
+    let pvc_name = format!("{}-results", run_name);
+    let pod_name = format!("{}-report-dl", run_name);
 
-    if !results.validity_violations.is_empty() {
-        println!("Violations:");
-        for v in &results.validity_violations {
-            println!("  - {}", v);
+    println!("Fetching report from PVC {} ...", pvc_name);
+
+    // Create a temporary pod that mounts the results PVC.
+    let pod_manifest = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": { "name": &pod_name, "namespace": namespace },
+        "spec": {
+            "restartPolicy": "Never",
+            "containers": [{
+                "name": "report-reader",
+                "image": "busybox:1.36",
+                "command": ["sleep", "120"],
+                "volumeMounts": [{ "name": "results", "mountPath": "/results" }]
+            }],
+            "volumes": [{
+                "name": "results",
+                "persistentVolumeClaim": { "claimName": &pvc_name }
+            }]
         }
-    }
-    if !results.warnings.is_empty() {
-        println!("Warnings:");
-        for w in &results.warnings {
-            println!("  - {}", w);
-        }
-    }
-    println!("Harness saturated: {}", results.harness_saturated);
+    });
 
-    if let Some(ref sc) = results.scorecard {
-        println!();
-        println!("Scorecard:");
-        println!("  Baseline P99:         {:.2} ms", sc.baseline_p99_ms);
-        println!("  Overlap P99:          {:.2} ms", sc.overlap_p99_ms);
-        println!("  P99 Degradation:      {:.2}x", sc.p99_degradation_ratio);
-        println!("  Query Error Rate:     {:.4}", sc.query_error_rate_overlap);
-        println!("  Peak Backlog:         {}", sc.peak_backlog);
-        println!("  Backlog Drain Time:   {:.1}s", sc.backlog_drain_time_s);
-        println!("  Recovery Time:        {:.1}s", sc.recovery_time_s);
+    // Apply the pod.
+    let mut child = Command::new("kubectl")
+        .args(["apply", "-f", "-", "-n", namespace])
+        .stdin(std::process::Stdio::piped())
+        .spawn()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(pod_manifest.to_string().as_bytes()).await?;
+    }
+    child.wait().await?;
+
+    // Wait for the pod to be Running.
+    let wait = Command::new("kubectl")
+        .args([
+            "wait",
+            "--for=condition=Ready",
+            &format!("pod/{}", pod_name),
+            "-n",
+            namespace,
+            "--timeout=60s",
+        ])
+        .status()
+        .await?;
+    if !wait.success() {
+        let _ = Command::new("kubectl")
+            .args([
+                "delete",
+                "pod",
+                &pod_name,
+                "-n",
+                namespace,
+                "--ignore-not-found",
+            ])
+            .status()
+            .await;
+        anyhow::bail!("Timed out waiting for report-reader pod");
     }
 
-    // Write JSON results to output directory.
-    let json = serde_json::to_string_pretty(results)?;
-    let output_path = format!("{}/results.json", output_dir);
     tokio::fs::create_dir_all(output_dir).await?;
-    tokio::fs::write(&output_path, &json).await?;
+
+    // Copy each report file locally.
+    let files = [
+        "report.html",
+        "run.json",
+        "timeseries.csv",
+        "timed_out_queries.json",
+        "per_query_latency.json",
+        "per_query_timeseries.json",
+        "per_category_latency.json",
+    ];
+    for file in &files {
+        let src = format!("{}/{}:/results/{}", namespace, pod_name, file);
+        let dst = format!("{}/{}", output_dir, file);
+        let status = Command::new("kubectl")
+            .args(["cp", &src, &dst])
+            .status()
+            .await?;
+        if status.success() {
+            println!("  {}", dst);
+        } else {
+            eprintln!(
+                "  Warning: {} not found in PVC (reporter may have failed)",
+                file
+            );
+        }
+    }
+
+    // Clean up.
+    Command::new("kubectl")
+        .args([
+            "delete",
+            "pod",
+            &pod_name,
+            "-n",
+            namespace,
+            "--ignore-not-found",
+        ])
+        .status()
+        .await?;
+
     println!();
-    println!("Results written to: {}", output_path);
+    println!("Reports saved to: {}/", output_dir);
+    println!("  Open {}/report.html in your browser.", output_dir);
 
     Ok(())
 }
@@ -91,6 +169,10 @@ pub async fn regenerate(metrics_path: &str, output_dir: &str) -> anyhow::Result<
         println!("Reports regenerated successfully.");
         println!("  {}/report.html", output_dir);
         println!("  {}/run.json", output_dir);
+        println!("  {}/timed_out_queries.json", output_dir);
+        println!("  {}/per_query_latency.json", output_dir);
+        println!("  {}/per_query_timeseries.json", output_dir);
+        println!("  {}/per_category_latency.json", output_dir);
     } else {
         anyhow::bail!("Report regeneration failed");
     }
