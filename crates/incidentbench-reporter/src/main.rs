@@ -62,6 +62,15 @@ async fn main() -> anyhow::Result<()> {
             vec![]
         };
 
+    // Optionally load sampled query error records written by the aggregator.
+    let query_errors_path = format!("{}/query_error_samples.json", cli.input);
+    let query_error_samples: Vec<serde_json::Value> =
+        if let Ok(s) = tokio::fs::read_to_string(&query_errors_path).await {
+            serde_json::from_str(&s).unwrap_or_default()
+        } else {
+            vec![]
+        };
+
     // Optionally load per-query latency summary written by the aggregator.
     let per_query_path = format!("{}/per_query_latency.json", cli.input);
     let per_query_latency: Vec<serde_json::Value> =
@@ -93,6 +102,7 @@ async fn main() -> anyhow::Result<()> {
         &derived,
         &scorecard,
         &timed_out_queries,
+        &query_error_samples,
         &per_category_latency,
         &per_query_latency,
         &per_query_timeseries,
@@ -130,6 +140,14 @@ async fn main() -> anyhow::Result<()> {
     )
     .await?;
     info!(path = %copied_timeouts_path, "Timed-out queries JSON written");
+
+    let copied_query_errors_path = format!("{}/query_error_samples.json", cli.output);
+    tokio::fs::write(
+        &copied_query_errors_path,
+        serde_json::to_string_pretty(&query_error_samples)?,
+    )
+    .await?;
+    info!(path = %copied_query_errors_path, "Query error samples JSON written");
 
     let copied_per_query_path = format!("{}/per_query_latency.json", cli.output);
     tokio::fs::write(

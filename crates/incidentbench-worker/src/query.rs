@@ -18,7 +18,7 @@ use anyhow::Context;
 use incidentbench_common::adapters;
 use incidentbench_common::metrics::latency_distribution_from_values;
 use incidentbench_common::proto::worker::{
-    QueryTypeLatency, TimedOutQueryRecord, WorkerMetricSnapshot,
+    QueryErrorRecord, QueryTypeLatency, TimedOutQueryRecord, WorkerMetricSnapshot,
 };
 use incidentbench_common::ratelimit::TokenBucketRateLimiter;
 use incidentbench_common::scenario::{
@@ -175,6 +175,7 @@ pub async fn run(config_path: &str) -> anyhow::Result<()> {
     let mut per_type_latencies: HashMap<String, Vec<f64>> = HashMap::new();
     let mut per_type_executed: HashMap<String, u64> = HashMap::new();
     let mut per_type_errors: HashMap<String, u64> = HashMap::new();
+    let mut pending_error_records: Vec<QueryErrorRecord> = Vec::new();
 
     loop {
         // Emit 1-second snapshot.
@@ -216,6 +217,7 @@ pub async fn run(config_path: &str) -> anyhow::Result<()> {
                 target_rate: current_rate_mqps as i64,
                 concurrent_sessions: 0,
                 timed_out_queries: vec![],
+                query_error_records: std::mem::take(&mut pending_error_records),
             };
 
             if let Err(e) = metrics_tx.try_send(snapshot) {
@@ -268,6 +270,7 @@ pub async fn run(config_path: &str) -> anyhow::Result<()> {
         // Each query specifies its target index via the `index` field.
         // Enforce a timeout at the worker level (adapter may also have its own).
         let query_timeout = Duration::from_millis(query.timeout_ms.max(5000));
+        let query_started = Instant::now();
         let result = match tokio::time::timeout(
             query_timeout,
             adapter.execute_query(query, &query.index, &config.query_endpoint, &variables),
@@ -293,6 +296,16 @@ pub async fn run(config_path: &str) -> anyhow::Result<()> {
                 if qr.error.is_some() {
                     query_errors += 1;
                     *per_type_errors.entry(query.name.clone()).or_default() += 1;
+                    pending_error_records.push(query_error_record(
+                        query,
+                        query.category.as_deref().unwrap_or(""),
+                        &current_phase,
+                        &worker_id,
+                        effective_index,
+                        qr.duration_ms,
+                        qr.timed_out,
+                        qr.error.as_deref().unwrap_or("query failed"),
+                    ));
                 }
             }
             Err(e) => {
@@ -300,6 +313,17 @@ pub async fn run(config_path: &str) -> anyhow::Result<()> {
                 query_errors += 1;
                 *per_type_executed.entry(query.name.clone()).or_default() += 1;
                 *per_type_errors.entry(query.name.clone()).or_default() += 1;
+                let message = e.to_string();
+                pending_error_records.push(query_error_record(
+                    query,
+                    query.category.as_deref().unwrap_or(""),
+                    &current_phase,
+                    &worker_id,
+                    effective_index,
+                    query_started.elapsed().as_secs_f64() * 1000.0,
+                    is_timeout_error(&message),
+                    &message,
+                ));
                 debug!("Query failed: {}", e);
             }
         }
@@ -393,6 +417,7 @@ async fn run_session_loop(
     let mut per_query_executed: HashMap<String, u64> = HashMap::new();
     let mut per_query_errors: HashMap<String, u64> = HashMap::new();
     let mut pending_timeouts: Vec<TimedOutRecord> = Vec::new();
+    let mut pending_error_records: Vec<QueryErrorRecord> = Vec::new();
 
     info!(worker_id = %worker_id, "Session loop started");
 
@@ -449,6 +474,7 @@ async fn run_session_loop(
                 target_rate: 1, // 1 active user session per worker pod
                 concurrent_sessions: 1,
                 timed_out_queries: proto_timeouts,
+                query_error_records: std::mem::take(&mut pending_error_records),
             };
 
             if let Err(e) = metrics_tx.try_send(snapshot) {
@@ -510,6 +536,7 @@ async fn run_session_loop(
                                 timeout_ms: r.timeout_ms as i64,
                             })
                             .collect();
+                        let proto_errors = std::mem::take(&mut pending_error_records);
                         let flush_snapshot = WorkerMetricSnapshot {
                             worker_id: worker_id.to_string(),
                             worker_mode: "query-session".to_string(),
@@ -526,6 +553,7 @@ async fn run_session_loop(
                             target_rate: 1,
                             concurrent_sessions: configured_concurrent_sessions,
                             timed_out_queries: proto_timeouts,
+                            query_error_records: proto_errors,
                             ..Default::default()
                         };
                         let _ = metrics_tx.try_send(flush_snapshot);
@@ -598,15 +626,49 @@ async fn run_session_loop(
                             duration_ms: qr.duration_ms,
                             timeout_ms: q_timeout_ms,
                         });
+                        pending_error_records.push(query_error_record_parts(
+                            &query_name,
+                            &category,
+                            &current_phase,
+                            worker_id,
+                            effective_index,
+                            now_ms,
+                            qr.duration_ms,
+                            true,
+                            qr.error.as_deref().unwrap_or("query timed out"),
+                        ));
                     } else if qr.error.is_some() {
                         query_errors += 1;
                         *per_query_errors.entry(query_name.clone()).or_default() += 1;
+                        pending_error_records.push(query_error_record_parts(
+                            &query_name,
+                            &category,
+                            &current_phase,
+                            worker_id,
+                            effective_index,
+                            now_ms,
+                            qr.duration_ms,
+                            false,
+                            qr.error.as_deref().unwrap_or("query failed"),
+                        ));
                         debug!("Session query error: {:?}", qr.error);
                     }
                 }
                 Err(e) => {
                     query_errors += 1;
                     *per_query_errors.entry(query_name.clone()).or_default() += 1;
+                    let message = e.to_string();
+                    pending_error_records.push(query_error_record_parts(
+                        &query_name,
+                        &category,
+                        &current_phase,
+                        worker_id,
+                        effective_index,
+                        now_ms,
+                        0.0,
+                        is_timeout_error(&message),
+                        &message,
+                    ));
                     debug!("Session query failed: {}", e);
                 }
             }
@@ -643,6 +705,111 @@ fn generate_query_variables(query: &QueryDef, rng: &mut ChaCha8Rng) -> HashMap<S
         }
     }
     vars
+}
+
+fn query_error_record(
+    query: &QueryDef,
+    category: &str,
+    phase: &str,
+    worker_id: &str,
+    worker_index: u32,
+    duration_ms: f64,
+    timed_out: bool,
+    message: &str,
+) -> QueryErrorRecord {
+    let timestamp_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    query_error_record_parts(
+        &query.name,
+        category,
+        phase,
+        worker_id,
+        worker_index,
+        timestamp_ms,
+        duration_ms,
+        timed_out,
+        message,
+    )
+}
+
+fn query_error_record_parts(
+    query_name: &str,
+    category: &str,
+    phase: &str,
+    worker_id: &str,
+    worker_index: u32,
+    timestamp_ms: i64,
+    duration_ms: f64,
+    timed_out: bool,
+    message: &str,
+) -> QueryErrorRecord {
+    QueryErrorRecord {
+        query_name: query_name.to_string(),
+        category: category.to_string(),
+        phase: phase.to_string(),
+        worker_id: worker_id.to_string(),
+        worker_index: worker_index as i32,
+        timestamp_ms,
+        duration_ms,
+        timed_out,
+        error_class: classify_query_error(message, timed_out).to_string(),
+        message: truncate_error_message(message),
+    }
+}
+
+fn classify_query_error(message: &str, timed_out: bool) -> &'static str {
+    if timed_out || is_timeout_error(message) {
+        return "timeout";
+    }
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("cancel") {
+        "cancelled"
+    } else if lower.contains("resource")
+        || lower.contains("oom")
+        || lower.contains("memory")
+        || lower.contains("exhaust")
+        || lower.contains("enhance_your_calm")
+    {
+        "resource"
+    } else if lower.contains("sql")
+        || lower.contains("sqlstate")
+        || lower.contains("code=")
+        || lower.contains("syntax")
+        || lower.contains("parse")
+        || lower.contains("relation")
+        || lower.contains("column")
+    {
+        "sql"
+    } else if lower.contains("connection")
+        || lower.contains("connect")
+        || lower.contains("transport")
+        || lower.contains("broken pipe")
+        || lower.contains("connection reset")
+    {
+        "connection"
+    } else if lower.contains("http 5") || lower.contains("internal") {
+        "target_internal"
+    } else {
+        "unknown"
+    }
+}
+
+fn is_timeout_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("timed out") || lower.contains("timeout") || lower.contains("deadline")
+}
+
+fn truncate_error_message(message: &str) -> String {
+    const MAX_LEN: usize = 1024;
+    if message.len() <= MAX_LEN {
+        message.to_string()
+    } else {
+        let mut s = message[..MAX_LEN].to_string();
+        s.push_str("…");
+        s
+    }
 }
 
 async fn stream_metrics_to_aggregator(

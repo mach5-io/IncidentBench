@@ -167,6 +167,7 @@ pub async fn run(config_path: &str) -> anyhow::Result<()> {
                 target_rate: current_rate as i64,
                 concurrent_sessions: 0,
                 timed_out_queries: vec![],
+                query_error_records: vec![],
             };
 
             if let Err(e) = metrics_tx.try_send(snapshot) {
