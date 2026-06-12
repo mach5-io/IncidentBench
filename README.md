@@ -363,7 +363,7 @@ kubectl apply -f /tmp/mach5-query-bench-run.yaml
 kubectl delete ibrun <run-name> -n incidentbench-system
 ```
 
-This removes all resources created for the run (worker Deployments, PVC, reporter Job).
+This removes transient resources created for the run. Results are written to the run's results PVC; delete that PVC manually when you no longer need the report artifacts.
 
 ---
 
