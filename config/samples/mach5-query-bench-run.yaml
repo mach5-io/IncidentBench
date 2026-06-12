@@ -341,22 +341,22 @@ spec:
         - "recovery_time"
 
   images:
-    worker: "ghcr.io/mach5-io/worker:v0.1.0"
-    reporter: "ghcr.io/mach5-io/reporter:v0.1.0"
+    worker: "ghcr.io/mach5-io/incidentbench-worker:v0.1.0"
+    reporter: "ghcr.io/mach5-io/incidentbench-reporter:v0.1.0"
 
   target:
     adapter: "mach5"
     config:
-      endpoint: "http://192.168.29.172:31950"   # ← microk8s node IP
+      endpoint: "http://<mach5-api-host>:<api-port>"
       namespace: "default"
       warehouse:
-        name: "m1"
+        name: "incidentbench-query-wh"
         numMediators: 1
         numOs: 1
-      pg_host: "192.168.29.172"                 # ← microk8s node IP
-      pg_port: 30685
-      pg_user: "mach5"
-      pg_password: "mach5"
+      pg_host: "<postgres-gateway-host>"
+      pg_port: 5432
+      pg_user: "<pg-user>"
+      pg_password: "<pg-password>"
       pg_dbname: "default"
 
   kafka:

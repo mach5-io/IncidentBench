@@ -1,0 +1,97 @@
+---
+# Query-only Mach5 example.
+#
+# Copy this file and replace the placeholder target settings before applying.
+# The referenced tables use the public OpenSearch Dashboards sample dataset;
+# adjust query SQL/table names for your own preloaded dataset.
+
+apiVersion: incidentbench.io/v1alpha1
+kind: IncidentBenchRun
+metadata:
+  name: query-only-mach5-example
+  namespace: incidentbench-system
+spec:
+  scenario:
+    scenario:
+      name: "query-only-mach5-example"
+      version: "1.0.0"
+      display_name: "Mach5 Query-Only Example"
+      description: "Query-only smoke test against a preloaded Mach5 dataset"
+      domain: "sre"
+
+    # No data_streams — query-only, no Kafka or ingest workers are created.
+
+    query_mix:
+      queries:
+        - name: "orders-eur"
+          type: "sql"
+          category: "basic-search"
+          template: ""
+          index: ""
+          timeout_ms: 10000
+          sql: >-
+            SELECT * FROM "opensearch_dashboards_sample_data_ecommerce"
+            WHERE currency = 'EUR' LIMIT 25
+
+        - name: "orders-high-value"
+          type: "sql"
+          category: "basic-search"
+          template: ""
+          index: ""
+          timeout_ms: 10000
+          sql: >-
+            SELECT order_id, customer_full_name, taxful_total_price
+            FROM "opensearch_dashboards_sample_data_ecommerce"
+            WHERE taxful_total_price > 100 LIMIT 25
+
+        - name: "orders-by-day"
+          type: "sql"
+          category: "aggregate"
+          template: ""
+          index: ""
+          timeout_ms: 10000
+          sql: >-
+            SELECT day_of_week, count(*), sum(taxful_total_price)
+            FROM "opensearch_dashboards_sample_data_ecommerce"
+            GROUP BY day_of_week ORDER BY sum(taxful_total_price) DESC
+
+    timeline:
+      phases:
+        - name: "baseline"
+          display_name: "Baseline"
+          duration_seconds: 60
+          query:
+            target_qps: 2.0
+
+    valid_run_criteria:
+      rules: []
+
+    report:
+      title: "Mach5 Query-Only Example"
+
+  target:
+    adapter: "mach5"
+    config:
+      endpoint: "http://<mach5-api-host>:<api-port>"
+      namespace: "default"
+      warehouse:
+        name: "incidentbench-query-wh"
+        numMediators: 1
+        numOs: 1
+      pg_host: "<postgres-gateway-host>"
+      pg_port: 5432
+      pg_user: "<pg-user>"
+      pg_password: "<pg-password>"
+      pg_dbname: "default"
+
+  kafka:
+    managed: false
+    bootstrap_servers: ""
+
+  workers:
+    query:
+      replicas: 1
+
+  images:
+    worker: "ghcr.io/mach5-io/incidentbench-worker:v0.1.0"
+    reporter: "ghcr.io/mach5-io/incidentbench-reporter:v0.1.0"
