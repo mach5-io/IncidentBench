@@ -53,6 +53,7 @@ pub struct AggregatedMetricPoint {
     // Worker counts.
     pub ingest_workers_reporting: u32,
     pub query_workers_reporting: u32,
+    pub concurrent_sessions: u32,
 
     // Harness health.
     pub harness_saturated: bool,
@@ -80,6 +81,21 @@ pub struct QueryGroupMetrics {
 pub struct TimeSeries {
     pub resolution_s: u32,
     pub points: Vec<AggregatedMetricPoint>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PerQueryTimeSeriesPoint {
+    pub timestamp_s: u64,
+    pub phase: String,
+    pub p95_ms: f64,
+    pub count: u64,
+    pub error_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PerQueryTimeSeries {
+    pub query_name: String,
+    pub points: Vec<PerQueryTimeSeriesPoint>,
 }
 
 /// Derived metrics computed after the run.
@@ -250,7 +266,11 @@ pub fn compute_derived(timeseries: &TimeSeries) -> DerivedMetrics {
         .map(|p| p.timestamp_s)
         .next()
         .unwrap_or(peak_lag_time);
-    let ingest_backlog_drain_time_s = (drain_time - peak_lag_time) as f64;
+    let ingest_backlog_drain_time_s = if ingest_peak_backlog == 0 || peak_lag_time == 0 {
+        0.0
+    } else {
+        (drain_time - peak_lag_time) as f64
+    };
 
     // Recovery time: time from recovery phase start until p99 returns to 1.2x baseline
     let recovery_start = recovery_points.first().map(|p| p.timestamp_s).unwrap_or(0);

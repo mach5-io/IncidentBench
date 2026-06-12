@@ -226,6 +226,277 @@ Deleting the CR triggers automatic cleanup of all resources (workers, aggregator
 kubectl delete ibrun smoke-test-001 -n incidentbench-system
 ```
 
+## Running the Query-Only Harness
+
+The query-only harness measures query performance against a pre-loaded dataset with no Kafka or ingest workers. Use it to benchmark Mach5 query latency in isolation.
+
+### Prerequisites
+
+- Operator deployed and running in `incidentbench-system`
+- A Mach5 cluster reachable from the cluster (PostgreSQL gateway accessible)
+- A dataset pre-loaded into Mach5 (see target config below)
+- `incidentbench` CLI installed and `kubectl` configured
+
+### Step 1 — Apply the run manifest
+
+For a local kind cluster targeting the microk8s Mach5 dev cluster:
+
+```bash
+kubectl apply -f config/samples/kind-query-test.yaml
+```
+
+For a production Mach5 cluster:
+
+```bash
+kubectl apply -f config/samples/mach5-query-bench-run.yaml
+```
+
+The run manifests contain all SQL queries inline — no ConfigMaps or external files are needed.
+
+> **Note:** Before applying `kind-query-test.yaml` or `mach5-query-bench-run.yaml`, verify the `endpoint` and `pg_host` fields match your Mach5 node IP:
+> ```bash
+> kubectl get node <node-name> -o wide   # check INTERNAL-IP
+> ```
+> Then update `spec.target.config.endpoint` and `spec.target.config.pg_host` in the file.
+
+### Step 2 — Watch until Completed
+
+The CRD has no printer columns, so `kubectl get incidentbenchrun -w` only shows NAME and AGE. Use these instead:
+
+```bash
+# Continuous phase watch
+watch kubectl get ibrun <run-name> -n incidentbench-system -o 'jsonpath={.status.phase}'
+
+# Check phase once
+kubectl get ibrun <run-name> -n incidentbench-system -o 'jsonpath={.status.phase}'
+
+# Check progress (elapsed, QPS, phase)
+kubectl get ibrun <run-name> -n incidentbench-system \
+  -o 'jsonpath={.status}' | python3 -m json.tool
+```
+
+The run transitions through these phases:
+
+```
+Pending → Preparing → Initializing → Running → Aggregating → Reporting → Completed
+```
+
+During `Running`, query workers fire SQL queries against the Mach5 PostgreSQL gateway at the configured QPS. After `Aggregating`, the operator launches a reporter Job that produces the HTML report. The run reaches `Completed` when the report is written.
+
+To follow operator and worker logs:
+
+```bash
+# Operator
+kubectl logs -n incidentbench-system -l app.kubernetes.io/name=incidentbench-operator -f
+
+# Query worker pods
+kubectl get pods -n incidentbench-system
+kubectl logs -n incidentbench-system <query-worker-pod> -f
+```
+
+### Step 3 — Download the report
+
+Once the run shows `Completed`:
+
+```bash
+# Quick scorecard in terminal
+kubectl get ibrun <run-name> -n incidentbench-system \
+  -o 'jsonpath={.status.results}' | python3 -m json.tool
+
+# Full report files
+incidentbench report get <run-name> \
+  --namespace incidentbench-system \
+  --output ./results/
+```
+
+This copies three files to `./results/`:
+
+| File | Contents |
+|---|---|
+| `report.html` | Interactive HTML report: per-phase latency, per-query P50/P95/P99, scorecard |
+| `run.json` | Full structured result including all metrics and validity assessment |
+| `timeseries.csv` | Per-second QPS and latency timeseries for import into other tools |
+
+### Step 4 — Open the report
+
+```bash
+# Linux
+xdg-open ./results/report.html
+
+# macOS
+open ./results/report.html
+```
+
+The HTML report shows:
+- Per-phase query latency (P50 / P95 / P99 / max)
+- Per-query breakdown (which queries were slowest)
+- Scorecard with validity assessment against the configured criteria
+- Timeseries chart of QPS and latency over the run duration
+
+### Repeat runs
+
+A completed or failed run must be deleted before re-applying the same manifest:
+
+```bash
+kubectl delete ibrun <run-name> -n incidentbench-system
+kubectl apply -f config/samples/<manifest>.yaml
+```
+
+Examples:
+```bash
+# kind query test
+kubectl delete ibrun kind-query-test-001 -n incidentbench-system
+kubectl apply -f config/samples/kind-query-test.yaml
+
+# mach5 query benchmark
+kubectl delete ibrun mach5-qb-run-001 -n incidentbench-system
+kubectl apply -f config/samples/mach5-query-bench-run.yaml
+```
+
+### Cleaning up
+
+```bash
+kubectl delete ibrun <run-name> -n incidentbench-system
+```
+
+This removes all resources created for the run (worker Deployments, PVC, reporter Job).
+
+---
+
+### Query fields explained
+
+The `query_mix.queries` entries in the YAML have these fields:
+
+| Field | Purpose for SQL queries |
+|---|---|
+| `name` | Unique identifier — appears in the report's per-query latency table |
+| `type` | Must be `"sql"` to route through the PostgreSQL gateway |
+| `category` | Groups queries into dashboard panels. When every query in `query_mix` has a `category`, the run automatically enters **session mode** (see below) |
+| `sql` | Inline SQL statement — executed directly, no file mount needed |
+| `timeout_ms` | Per-query deadline in milliseconds; queries exceeding this are recorded in the timed-out queries log |
+| `template` | Unused for SQL queries — set to `""` |
+| `index` | Unused for SQL queries — set to `""` |
+
+### Session Mode — Simulating Concurrent Dashboard Users
+
+When every query in `query_mix` has a `category` field set, IncidentBench automatically switches into **session mode**. This simulates realistic analyst behaviour: each user simultaneously loads all dashboard panels (one query per category) and then cycles through the panel queries round-robin.
+
+**How a single user's tick works:**
+
+1. For each category, pick the next query in that category (round-robin, wrapping at the end).
+2. Fire all category queries simultaneously using `join_all` — one query per category per tick.
+3. If a query exceeds its `timeout_ms`, it is recorded in the timed-out query log with its category, phase, actual duration, and configured threshold.
+
+**Simulating N concurrent users:**
+
+Each query worker pod runs one independent session loop. Set `workers.query.replicas` to the number of users you want to simulate:
+
+```yaml
+workers:
+  query:
+    replicas: 5   # ← 5 concurrent users, each firing all categories simultaneously
+```
+
+**Example — 4 dashboard categories, 5 concurrent users:**
+
+```yaml
+spec:
+  scenario:
+    query_mix:
+      queries:
+        # --- basic-search panel ---
+        - name: "bs-01-all-eur"
+          type: "sql"
+          category: "basic-search"
+          sql: >-
+            SELECT * FROM "ecommerce" WHERE currency = 'EUR' LIMIT 25
+          timeout_ms: 10000
+          template: ""
+          index: ""
+
+        - name: "bs-02-high-value"
+          type: "sql"
+          category: "basic-search"
+          sql: >-
+            SELECT order_id, customer_full_name, taxful_total_price
+            FROM "ecommerce" WHERE taxful_total_price > 100 LIMIT 25
+          timeout_ms: 10000
+          template: ""
+          index: ""
+
+        # --- pie-chart panel ---
+        - name: "pc-01-gender-split"
+          type: "sql"
+          category: "pie-chart"
+          sql: >-
+            SELECT customer_gender, count(*), avg(taxful_total_price)
+            FROM "ecommerce" GROUP BY customer_gender
+          timeout_ms: 10000
+          template: ""
+          index: ""
+
+        # --- time-series panel ---
+        - name: "ts-01-avg-by-day"
+          type: "sql"
+          category: "time-series"
+          sql: >-
+            SELECT day_of_week, avg(taxful_total_price)
+            FROM "ecommerce" GROUP BY day_of_week
+          timeout_ms: 10000
+          template: ""
+          index: ""
+
+        # --- logs panel ---
+        - name: "lg-01-errors"
+          type: "sql"
+          category: "logs"
+          sql: >-
+            SELECT timestamp, clientip, request, response
+            FROM "logs" WHERE response >= '500' LIMIT 25
+          timeout_ms: 10000
+          template: ""
+          index: ""
+
+  workers:
+    query:
+      replicas: 5   # ← 5 concurrent users
+```
+
+Each tick for one user fires `basic-search`, `pie-chart`, `time-series`, and `logs` simultaneously. With 5 replicas, 5 independent users run their session loops in parallel — 20 queries in flight per tick across the cluster.
+
+**Query firing frequency per user (full run)**
+
+The smaller the pool, the more each query is exercised. Using `mach5-query-bench-run.yaml` as an example (600 s total, 4 phases):
+
+| Category | Pool size | Fires per query (1 user) | Fires per query (4 users) |
+|---|---|---|---|
+| `basic-search` | 8 | 75 | 300 |
+| `pie-chart` | 3 | 200 | 800 |
+| `time-series` | 3 | 200 | 800 |
+| `logs` | 10 | 60 | 240 |
+
+Formula: `fires per query = total_duration_s / pool_size` (assumes ~1 tick/sec; scale with actual query latency).
+
+**Throughput scales with query latency**
+
+There is no rate limiter in session mode — each tick fires immediately after the previous one completes. Tick rate = `1 / slowest_category_latency`:
+
+| Avg query latency | Ticks/sec | Total queries (600 s, 4 users, 4 categories) |
+|---|---|---|
+| 100 ms | ~10 | ~96,000 |
+| 500 ms | ~2 | ~19,200 |
+| 1,000 ms | ~1 | ~9,600 |
+| 2,000 ms | ~0.5 | ~4,800 |
+| 5,000 ms (near timeout) | ~0.2 | ~1,920 |
+
+The bottleneck is always the **slowest category in that tick** — if `logs` takes 2 s and all others take 100 ms, the whole tick takes 2 s. The `target_qps` field in the phase config is ignored in session mode.
+
+**Report output in session mode:**
+
+- `per_query_latency.json` — P50 / P95 / P99 / max per category, plus a `timeout_count`
+- `timed_out_queries.json` — every timed-out query: category, query name, phase, actual duration, and configured threshold
+- HTML report — per-category latency table and a timed-out queries table (empty if none occurred)
+
 ## Understanding Results
 
 After a run completes, `status.results` contains the benchmark scorecard. Here is an example from the [smoke test](config/samples/smoke-test.yaml):
@@ -348,7 +619,6 @@ spec:
       queries:
         - name: "find_errors"
           type: search
-          weight: 1.0
           template: "level:ERROR"
           timeout_ms: 10000
 
@@ -426,10 +696,12 @@ Defines the queries that workers execute during the benchmark.
 query_mix:
   queries:
     - name: "error_search"          # Unique query identifier
-      type: search                  # search or aggregation
-      weight: 0.5                   # Fraction of QPS allocated to this query
-      template: "level:ERROR"       # Query template
-      timeout_ms: 10000             # Per-query timeout
+      type: search                  # search, aggregation, or sql
+      category: "logs"              # Optional: enables session mode when set on all queries
+      template: "level:ERROR"       # Query template (set to "" for sql type)
+      sql: >-                       # Inline SQL (sql type only; takes priority over template)
+        SELECT * FROM "logs" WHERE level = 'ERROR' LIMIT 25
+      timeout_ms: 10000             # Per-query deadline in ms
       limit: 100                    # Max results to return (optional)
       sort: "@timestamp:desc"       # Sort order (optional)
       description: "Find errors"    # Human-readable description
@@ -438,7 +710,7 @@ query_mix:
           source: "recently_ingested"
 ```
 
-Query weights across all queries must sum to 1.0.
+When `category` is set on every query, session mode is activated and queries are grouped and fired by category. When `category` is absent on any query, the run uses rate-controlled mode where all queries fire at the configured `target_qps`.
 
 ##### `scenario.timeline` — Phase Definitions
 

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use incidentbench_common::metrics::{DerivedMetrics, Scorecard, TimeSeries};
+use incidentbench_common::metrics::{DerivedMetrics, PerQueryTimeSeries, Scorecard, TimeSeries};
 use incidentbench_common::scenario::Scenario;
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -22,6 +22,10 @@ pub fn generate(
     timeseries: &TimeSeries,
     derived: &DerivedMetrics,
     scorecard: &Scorecard,
+    timed_out_queries: &[serde_json::Value],
+    per_category_latency: &[serde_json::Value],
+    per_query_latency: &[serde_json::Value],
+    per_query_timeseries: &[PerQueryTimeSeries],
 ) -> anyhow::Result<String> {
     // Compute per-phase summaries.
     let phases: Vec<serde_json::Value> = scenario
@@ -36,20 +40,32 @@ pub fn generate(
                 .collect();
 
             let ingest_total: u64 = phase_points.iter().map(|p| p.ingest_events_produced).sum();
-            let ingest_avg_eps = if !phase_points.is_empty() {
-                ingest_total as f64 / phase_points.len() as f64
+            let phase_duration_s = phase_def.duration_seconds as f64;
+
+            let ingest_avg_eps = if phase_duration_s > 0.0 {
+                ingest_total as f64 / phase_duration_s
             } else {
                 0.0
             };
 
             let query_total: u64 = phase_points.iter().map(|p| p.query_executed).sum();
-            let query_avg_qps = if !phase_points.is_empty() {
-                query_total as f64 / phase_points.len() as f64
+            let query_avg_qps = if phase_duration_s > 0.0 {
+                query_total as f64 / phase_duration_s
             } else {
                 0.0
             };
 
             let query_errors: u64 = phase_points.iter().map(|p| p.query_errors).sum();
+            let query_timeouts: u64 = timed_out_queries
+                .iter()
+                .filter(|r| {
+                    r.get("phase")
+                        .and_then(|v| v.as_str())
+                        .map(|phase| phase == phase_def.name)
+                        .unwrap_or(false)
+                })
+                .count() as u64;
+            let query_non_timeout_errors = query_errors.saturating_sub(query_timeouts);
             let query_error_rate = if query_total > 0 {
                 query_errors as f64 / query_total as f64
             } else {
@@ -68,6 +84,8 @@ pub fn generate(
             // Sum target EPS across all data streams for this phase.
             let phase_target_eps: u64 = scenario
                 .data_streams
+                .as_deref()
+                .unwrap_or(&[])
                 .iter()
                 .map(|s| {
                     s.ingest
@@ -89,8 +107,15 @@ pub fn generate(
                 "query": {
                     "target_qps": phase_def.query.target_qps,
                     "achieved_avg_qps": query_avg_qps,
+                    "concurrent_sessions": phase_points
+                        .iter()
+                        .map(|p| p.concurrent_sessions)
+                        .max()
+                        .unwrap_or(0),
                     "total_queries": query_total,
                     "total_errors": query_errors,
+                    "total_non_timeout_errors": query_non_timeout_errors,
+                    "total_timeouts": query_timeouts,
                     "error_rate": query_error_rate,
                     "latency_p50_ms": avg_p50,
                     "latency_p95_ms": avg_p95,
@@ -105,7 +130,7 @@ pub fn generate(
     let (valid, violations, warnings) = evaluate_validity(timeseries, scenario);
 
     // Per-query-group comparison (populated when query_groups are configured).
-    let query_group_comparison = build_query_group_comparison(timeseries);
+    let query_group_comparison = build_query_group_comparison(timeseries, scenario);
 
     let report = json!({
         "incidentbench_version": incidentbench_common::VERSION,
@@ -127,7 +152,7 @@ pub fn generate(
             },
             "kafka": {
                 "bootstrap_servers": "",
-                "topics": scenario.data_streams.iter().map(|s| s.schema.index_name.as_str()).collect::<Vec<_>>(),
+                "topics": scenario.data_streams.as_deref().unwrap_or(&[]).iter().map(|s| s.schema.index_name.as_str()).collect::<Vec<_>>(),
                 "partitions": 10,
             },
             "scaling": {
@@ -160,13 +185,102 @@ pub fn generate(
             "point_count": timeseries.points.len(),
         },
         "query_groups": query_group_comparison,
+        "timed_out_queries": timed_out_queries,
+        "per_category_latency": per_category_latency,
+        "per_query_latency": per_query_latency,
+        "per_query_timeseries": per_query_timeseries,
     });
 
     serde_json::to_string_pretty(&report).map_err(Into::into)
 }
 
+pub fn build_per_category_latency(
+    scenario: &Scenario,
+    timed_out_queries: &[serde_json::Value],
+    per_query_latency: &[serde_json::Value],
+) -> Vec<serde_json::Value> {
+    let pql_lookup: std::collections::HashMap<&str, &serde_json::Value> = per_query_latency
+        .iter()
+        .filter_map(|v| v.get("query_name").and_then(|n| n.as_str()).map(|n| (n, v)))
+        .collect();
+
+    let mut timeout_counts: std::collections::HashMap<String, u64> =
+        std::collections::HashMap::new();
+    for row in timed_out_queries {
+        if let Some(category) = row.get("category").and_then(|v| v.as_str()) {
+            *timeout_counts.entry(category.to_string()).or_default() += 1;
+        }
+    }
+
+    let mut category_rollups: std::collections::BTreeMap<
+        String,
+        (f64, f64, f64, f64, f64, u64, u64),
+    > = std::collections::BTreeMap::new(); // category -> (p50_sum, p95_max, p99_max, min, max, count, errors)
+
+    for query in &scenario.query_mix.queries {
+        let Some(category) = &query.category else {
+            continue;
+        };
+        let Some(entry) = pql_lookup.get(query.name.as_str()) else {
+            continue;
+        };
+
+        let p50 = entry.get("p50").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let p95 = entry.get("p95").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let p99 = entry.get("p99").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let min = entry.get("min").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let max = entry.get("max").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let count = entry.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
+        let errors = entry
+            .get("error_count")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0)
+            + entry
+                .get("timeout_count")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+
+        let row = category_rollups.entry(category.clone()).or_insert((
+            0.0,
+            0.0,
+            0.0,
+            f64::INFINITY,
+            0.0,
+            0,
+            0,
+        ));
+        row.0 += p50 * count as f64;
+        row.1 = row.1.max(p95);
+        row.2 = row.2.max(p99);
+        if count > 0 {
+            row.3 = row.3.min(min);
+        }
+        row.4 = row.4.max(max);
+        row.5 += count;
+        row.6 += errors;
+    }
+
+    category_rollups
+        .into_iter()
+        .map(|(category, (p50_sum, p95, p99, min, max, count, errors))| {
+            let timeout_count = timeout_counts.get(&category).copied().unwrap_or(0);
+            json!({
+                "query_name": category,
+                "min": if count > 0 { min } else { 0.0 },
+                "p50": if count > 0 { p50_sum / count as f64 } else { 0.0 },
+                "p95": p95,
+                "p99": p99,
+                "max": max,
+                "count": count,
+                "error_count": errors.saturating_sub(timeout_count),
+                "timeout_count": timeout_count,
+            })
+        })
+        .collect()
+}
+
 /// Build per-query-group comparison metrics from the time-series.
-fn build_query_group_comparison(timeseries: &TimeSeries) -> serde_json::Value {
+fn build_query_group_comparison(timeseries: &TimeSeries, scenario: &Scenario) -> serde_json::Value {
     // Collect all group names that appear in the time-series.
     let mut group_names = std::collections::HashSet::new();
     for point in &timeseries.points {
@@ -180,6 +294,20 @@ fn build_query_group_comparison(timeseries: &TimeSeries) -> serde_json::Value {
     }
 
     let mut groups = serde_json::Map::new();
+    let baseline_duration_s = scenario
+        .timeline
+        .phases
+        .iter()
+        .find(|p| p.name == "baseline")
+        .map(|p| p.duration_seconds as f64)
+        .unwrap_or(0.0);
+    let overlap_duration_s = scenario
+        .timeline
+        .phases
+        .iter()
+        .find(|p| p.name == "overlap")
+        .map(|p| p.duration_seconds as f64)
+        .unwrap_or(0.0);
     for group_name in &group_names {
         let baseline_points: Vec<_> = timeseries
             .points
@@ -196,8 +324,16 @@ fn build_query_group_comparison(timeseries: &TimeSeries) -> serde_json::Value {
 
         let baseline_p99 = mean_of(baseline_points.iter().map(|m| m.latency.p99));
         let overlap_p99 = mean_of(overlap_points.iter().map(|m| m.latency.p99));
-        let baseline_qps = mean_of(baseline_points.iter().map(|m| m.executed as f64));
-        let overlap_qps = mean_of(overlap_points.iter().map(|m| m.executed as f64));
+        let baseline_qps = if baseline_duration_s > 0.0 {
+            baseline_points.iter().map(|m| m.executed).sum::<u64>() as f64 / baseline_duration_s
+        } else {
+            0.0
+        };
+        let overlap_qps = if overlap_duration_s > 0.0 {
+            overlap_points.iter().map(|m| m.executed).sum::<u64>() as f64 / overlap_duration_s
+        } else {
+            0.0
+        };
         let overlap_errors: u64 = overlap_points.iter().map(|m| m.errors).sum();
         let overlap_total: u64 = overlap_points.iter().map(|m| m.executed).sum();
         let error_rate = if overlap_total > 0 {
@@ -283,15 +419,28 @@ pub fn evaluate_validity(
     if !baseline_points.is_empty() {
         let baseline_target_eps: u64 = scenario
             .data_streams
+            .as_deref()
+            .unwrap_or(&[])
             .iter()
             .map(|s| s.ingest.get("baseline").map(|i| i.target_eps).unwrap_or(0))
             .sum();
         if baseline_target_eps > 0 {
-            let achieved_eps = mean_of(
+            let baseline_duration_s = scenario
+                .timeline
+                .phases
+                .iter()
+                .find(|p| p.name == "baseline")
+                .map(|p| p.duration_seconds as f64)
+                .unwrap_or(0.0);
+            let achieved_eps = if baseline_duration_s > 0.0 {
                 baseline_points
                     .iter()
-                    .map(|p| p.ingest_events_produced as f64),
-            );
+                    .map(|p| p.ingest_events_produced)
+                    .sum::<u64>() as f64
+                    / baseline_duration_s
+            } else {
+                0.0
+            };
             let threshold = baseline_target_eps as f64 * 0.9;
             if achieved_eps < threshold {
                 violations.push(format!(
@@ -310,7 +459,12 @@ pub fn evaluate_validity(
             .iter()
             .find(|p| p.name == "overlap");
         if let Some(op) = overlap_phase {
-            let achieved_qps = mean_of(overlap_points.iter().map(|p| p.query_executed as f64));
+            let achieved_qps = if op.duration_seconds > 0 {
+                overlap_points.iter().map(|p| p.query_executed).sum::<u64>() as f64
+                    / op.duration_seconds as f64
+            } else {
+                0.0
+            };
             let threshold = op.query.target_qps * 0.5;
             if achieved_qps < threshold {
                 warnings.push(format!(
@@ -468,12 +622,13 @@ mod tests {
                 description: String::new(),
                 domain: "sre".to_string(),
             },
-            data_streams: vec![stream],
+            data_streams: Some(vec![stream]),
+            default_timeout_ms: 10_000,
+            query_session: None,
             query_mix: QueryMix {
                 queries: vec![QueryDef {
                     name: "q1".to_string(),
                     query_type: "search".to_string(),
-                    weight: 1.0,
                     template: "*".to_string(),
                     index: "test".to_string(),
                     sort: None,
@@ -481,6 +636,9 @@ mod tests {
                     timeout_ms: 5000,
                     description: String::new(),
                     variables: std::collections::HashMap::new(),
+                    sql: None,
+                    sql_file: None,
+                    category: None,
                 }],
             },
             query_groups: None,
@@ -539,6 +697,7 @@ mod tests {
             kafka_consumer_lag: 0,
             ingest_workers_reporting: 1,
             query_workers_reporting: 1,
+            concurrent_sessions: 0,
             harness_saturated: false,
             max_worker_cpu: 0.3,
             query_group_metrics: std::collections::HashMap::new(),
@@ -550,10 +709,10 @@ mod tests {
         let scenario = make_scenario_for_test();
         let mut points = Vec::new();
         for _ in 0..10 {
-            points.push(make_point("baseline", 5.0, 100));
+            points.push(make_point("baseline", 5.0, 300));
         }
         for _ in 0..10 {
-            points.push(make_point("overlap", 8.0, 500));
+            points.push(make_point("overlap", 8.0, 1500));
         }
         let ts = TimeSeries {
             resolution_s: 1,
@@ -568,12 +727,12 @@ mod tests {
         let scenario = make_scenario_for_test();
         let mut points = Vec::new();
         for _ in 0..5 {
-            points.push(make_point("baseline", 5.0, 100));
+            points.push(make_point("baseline", 5.0, 300));
         }
         // Inject a huge p99 spike in baseline
-        points.push(make_point("baseline", 50.0, 100));
+        points.push(make_point("baseline", 50.0, 300));
         for _ in 0..10 {
-            points.push(make_point("overlap", 8.0, 500));
+            points.push(make_point("overlap", 8.0, 1500));
         }
         let ts = TimeSeries {
             resolution_s: 1,
@@ -595,6 +754,9 @@ mod tests {
         }
         // Overlap has errors
         let mut overlap_point = make_point("overlap", 8.0, 500);
+        overlap_point.ingest_events_produced = 1500;
+        overlap_point.ingest_events_acknowledged = 1500;
+        overlap_point.ingest_target_eps = 1500;
         overlap_point.query_errors = 5; // 5/10 = 50% error rate > 10%
         for _ in 0..10 {
             points.push(overlap_point.clone());

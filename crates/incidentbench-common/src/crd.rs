@@ -77,6 +77,14 @@ pub struct IncidentBenchRunSpec {
     #[serde(default)]
     pub images: Option<ImageSpec>,
 
+    /// Local directory containing SQL query files, organised in category subdirectories
+    /// (e.g. `basic-search/01-query.sql`). The operator reads every `.sql` file
+    /// recursively, flattens paths to `{category}_{filename}` ConfigMap keys, and
+    /// mounts the resulting ConfigMap at `/queries/` in query worker pods.
+    /// Leave unset when SQL is inlined via `QueryDef.sql`.
+    #[serde(default)]
+    pub sql_dir: Option<String>,
+
     /// Dry-run mode — validate and print execution plan without running.
     #[serde(default)]
     pub dry_run: bool,

@@ -202,7 +202,6 @@ spec:
       queries:
         - name: "error_search"
           type: search
-          weight: 0.25
           template: "level:ERROR AND service:payment-service"
           index: "incidentbench-sre-outage"
           timeout_ms: 10000
@@ -210,7 +209,6 @@ spec:
 
         - name: "recent_errors"
           type: search
-          weight: 0.15
           template: "level:ERROR"
           sort: "@timestamp:desc"
           limit: 100
@@ -220,7 +218,6 @@ spec:
 
         - name: "error_code_agg"
           type: aggregation
-          weight: 0.15
           template: |
             filter: level:ERROR
             aggregate: terms(error_code)
@@ -230,7 +227,6 @@ spec:
 
         - name: "service_error_rate"
           type: aggregation
-          weight: 0.15
           template: |
             filter: *
             aggregate: terms(service) > terms(level)
@@ -240,7 +236,6 @@ spec:
 
         - name: "trace_lookup"
           type: search
-          weight: 0.10
           template: "trace_id:{{random_trace_id}}"
           index: "incidentbench-sre-outage"
           timeout_ms: 10000
@@ -251,7 +246,6 @@ spec:
 
         - name: "status_code_timeline"
           type: aggregation
-          weight: 0.10
           template: |
             filter: service:payment-service
             aggregate: date_histogram(@timestamp, interval=1m) > terms(http_status)
@@ -261,7 +255,6 @@ spec:
 
         - name: "slow_requests"
           type: search
-          weight: 0.05
           template: "response_time_ms:>5000 AND service:payment-service"
           index: "incidentbench-sre-outage"
           timeout_ms: 10000
@@ -269,7 +262,6 @@ spec:
 
         - name: "wildcard_message"
           type: search
-          weight: 0.05
           template: "message:*NullPointerException*"
           index: "incidentbench-sre-outage"
           timeout_ms: 15000

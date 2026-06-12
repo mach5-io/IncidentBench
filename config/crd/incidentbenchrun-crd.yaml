@@ -132,7 +132,7 @@ spec:
                 nullable: true
                 properties:
                   data_streams:
-                    description: Data streams — each stream maps to one index, one Kafka topic, and one ingest pipeline.
+                    description: Data streams — each stream maps to one index, one Kafka topic, and one ingest pipeline. Absent or empty → no ingest workers, no Kafka setup, no ingest pipeline.
                     items:
                       description: 'A single data stream: one index, one Kafka topic, one ingest pipeline.'
                       properties:
@@ -226,7 +226,14 @@ spec:
                       - name
                       - schema
                       type: object
+                    nullable: true
                     type: array
+                  default_timeout_ms:
+                    default: 10000
+                    description: Global query timeout. Used by SQL queries and as a fallback for query_session categories.
+                    format: uint64
+                    minimum: 0.0
+                    type: integer
                   query_groups:
                     description: Optional analyst groups with per-group query weight distributions.
                     items:
@@ -254,6 +261,10 @@ spec:
                       queries:
                         items:
                           properties:
+                            category:
+                              description: Category name for session mode. When all queries in query_mix carry a non-None category the operator automatically groups them into a QuerySession (round-robin per category, join_all across categories).
+                              nullable: true
+                              type: string
                             description:
                               default: ''
                               type: string
@@ -268,6 +279,14 @@ spec:
                             name:
                               type: string
                             sort:
+                              nullable: true
+                              type: string
+                            sql:
+                              description: Inline SQL text. Takes priority over sql_file when both are set. Used with query_type = "sql".
+                              nullable: true
+                              type: string
+                            sql_file:
+                              description: Path to a SQL file mounted at /queries/ inside the worker pod. Resolved by the operator from sql_dir; slash-separated path is flattened to {category}_{filename} in the ConfigMap key.
                               nullable: true
                               type: string
                             template:
@@ -289,19 +308,107 @@ spec:
                                 type: object
                               default: {}
                               type: object
-                            weight:
-                              format: double
-                              type: number
                           required:
                           - index
                           - name
                           - template
                           - type
-                          - weight
                           type: object
                         type: array
                     required:
                     - queries
+                    type: object
+                  query_session:
+                    description: Optional session-based execution mode for dashboard page-load simulation. When present, workers run session loops instead of the rate-controlled query loop.
+                    nullable: true
+                    properties:
+                      categories:
+                        items:
+                          properties:
+                            iteration:
+                              default: sequential
+                              enum:
+                              - sequential
+                              - weighted_random
+                              type: string
+                            name:
+                              type: string
+                            parallelism:
+                              default: 1
+                              description: Queries fired simultaneously from this category per tick; default 1.
+                              format: uint
+                              minimum: 0.0
+                              type: integer
+                            queries:
+                              items:
+                                properties:
+                                  category:
+                                    description: Category name for session mode. When all queries in query_mix carry a non-None category the operator automatically groups them into a QuerySession (round-robin per category, join_all across categories).
+                                    nullable: true
+                                    type: string
+                                  description:
+                                    default: ''
+                                    type: string
+                                  index:
+                                    description: Which index this query targets (must match a data_stream's schema.index_name).
+                                    type: string
+                                  limit:
+                                    format: uint32
+                                    minimum: 0.0
+                                    nullable: true
+                                    type: integer
+                                  name:
+                                    type: string
+                                  sort:
+                                    nullable: true
+                                    type: string
+                                  sql:
+                                    description: Inline SQL text. Takes priority over sql_file when both are set. Used with query_type = "sql".
+                                    nullable: true
+                                    type: string
+                                  sql_file:
+                                    description: Path to a SQL file mounted at /queries/ inside the worker pod. Resolved by the operator from sql_dir; slash-separated path is flattened to {category}_{filename} in the ConfigMap key.
+                                    nullable: true
+                                    type: string
+                                  template:
+                                    type: string
+                                  timeout_ms:
+                                    default: 0
+                                    format: uint64
+                                    minimum: 0.0
+                                    type: integer
+                                  type:
+                                    type: string
+                                  variables:
+                                    additionalProperties:
+                                      properties:
+                                        source:
+                                          type: string
+                                      required:
+                                      - source
+                                      type: object
+                                    default: {}
+                                    type: object
+                                required:
+                                - index
+                                - name
+                                - template
+                                - type
+                                type: object
+                              type: array
+                          required:
+                          - name
+                          - queries
+                          type: object
+                        type: array
+                      think_time_ms:
+                        default: 0
+                        description: Pause between session ticks in ms; 0 = loop as fast as possible.
+                        format: uint64
+                        minimum: 0.0
+                        type: integer
+                    required:
+                    - categories
                     type: object
                   report:
                     default:
@@ -398,7 +505,6 @@ spec:
                         type: array
                     type: object
                 required:
-                - data_streams
                 - query_mix
                 - scenario
                 - timeline
@@ -420,6 +526,10 @@ spec:
                 required:
                 - config_map
                 type: object
+              sql_dir:
+                description: Local directory containing SQL query files, organised in category subdirectories (e.g. `basic-search/01-query.sql`). The operator reads every `.sql` file recursively, flattens paths to `{category}_{filename}` ConfigMap keys, and mounts the resulting ConfigMap at `/queries/` in query worker pods. Leave unset when SQL is inlined via `QueryDef.sql`.
+                nullable: true
+                type: string
               target:
                 description: Target platform configuration.
                 properties:

@@ -1,0 +1,387 @@
+# IncidentBench Mach5 Query Benchmark Scenario v1.0.0
+#
+# Query-only benchmark targeting the Mach5 PostgreSQL gateway.
+# No ingest workers or Kafka topics are created — the dataset is assumed to
+# already exist in the target warehouse.
+#
+# Two execution modes are supported (mutually exclusive):
+#   1. Rate-controlled (default): query_mix + timeline.phases[*].query.target_qps
+#      Workers fire queries at a controlled rate; QPS varies per phase.
+#   2. Session-based: query_session present — each tick fires one query per
+#      category concurrently, simulating a dashboard page load. Useful for
+#      measuring end-to-end page-render latency under concurrent analyst load.
+#
+# To select session mode, uncomment the query_session block below and remove
+# (or set to 0) the target_qps values in the timeline.
+#
+# Total duration: 600 seconds (10 minutes, default time scale)
+
+scenario:
+  name: "mach5-query-bench"
+  version: "1.0.0"
+  display_name: "Mach5 Query Benchmark"
+  description: >
+    Measures Mach5 query performance against a pre-loaded dataset using the
+    PostgreSQL-compatible gateway. Covers a warm-up phase, a steady baseline,
+    and a stress phase where QPS is doubled to probe for latency degradation
+    under load.
+  domain: "sre"
+
+# data_streams is intentionally absent — no ingest infrastructure is created.
+
+query_mix:
+  queries:
+    # --- basic-search (raw record retrieval) ---
+    - name: "bs-01-all-eur"
+      type: "sql"
+      template: ""
+      index: ""
+      timeout_ms: 10000
+      description: "All EUR-currency orders, newest 25"
+      sql: >-
+        SELECT * FROM "opensearch_dashboards_sample_data_ecommerce"
+        WHERE currency = 'EUR' LIMIT 25
+
+    - name: "bs-02-high-value"
+      type: "sql"
+      template: ""
+      index: ""
+      timeout_ms: 10000
+      description: "Orders with taxful_total_price > 100"
+      sql: >-
+        SELECT order_id, customer_full_name, taxful_total_price
+        FROM "opensearch_dashboards_sample_data_ecommerce"
+        WHERE taxful_total_price > 100 LIMIT 25
+
+    - name: "bs-03-male-customers"
+      type: "sql"
+      template: ""
+      index: ""
+      timeout_ms: 10000
+      description: "Male customer orders"
+      sql: >-
+        SELECT * FROM "opensearch_dashboards_sample_data_ecommerce"
+        WHERE customer_gender = 'MALE' LIMIT 25
+
+    - name: "bs-04-monday-orders"
+      type: "sql"
+      template: ""
+      index: ""
+      timeout_ms: 10000
+      description: "Monday orders sorted by value descending"
+      sql: >-
+        SELECT order_id, order_date, taxful_total_price
+        FROM "opensearch_dashboards_sample_data_ecommerce"
+        WHERE day_of_week = 'Monday' ORDER BY taxful_total_price DESC LIMIT 25
+
+    - name: "bs-05-female-high-value"
+      type: "sql"
+      template: ""
+      index: ""
+      timeout_ms: 10000
+      description: "Female customers with orders > 150"
+      sql: >-
+        SELECT order_id, customer_full_name, taxful_total_price
+        FROM "opensearch_dashboards_sample_data_ecommerce"
+        WHERE customer_gender = 'FEMALE' AND taxful_total_price > 150 LIMIT 25
+
+    - name: "bs-06-low-value"
+      type: "sql"
+      template: ""
+      index: ""
+      timeout_ms: 10000
+      description: "Count of orders under 20"
+      sql: >-
+        SELECT count(*) FROM "opensearch_dashboards_sample_data_ecommerce"
+        WHERE taxful_total_price < 20
+
+    - name: "bs-07-weekend"
+      type: "sql"
+      template: ""
+      index: ""
+      timeout_ms: 10000
+      description: "Weekend orders (Saturday or Sunday)"
+      sql: >-
+        SELECT * FROM "opensearch_dashboards_sample_data_ecommerce"
+        WHERE day_of_week IN ('Saturday', 'Sunday') LIMIT 25
+
+    - name: "bs-08-total-count"
+      type: "sql"
+      template: ""
+      index: ""
+      timeout_ms: 10000
+      description: "Total order count"
+      sql: >-
+        SELECT count(*) FROM "opensearch_dashboards_sample_data_ecommerce"
+
+    # --- pie-chart (GROUP BY aggregations) ---
+    - name: "pc-04-top-manufacturers"
+      type: "sql"
+      template: ""
+      index: ""
+      timeout_ms: 10000
+      description: "Top 10 manufacturers by order count"
+      sql: >-
+        SELECT manufacturer, count(*) as cnt
+        FROM "opensearch_dashboards_sample_data_ecommerce"
+        GROUP BY manufacturer ORDER BY cnt DESC LIMIT 10
+
+    - name: "pc-05-gender-split"
+      type: "sql"
+      template: ""
+      index: ""
+      timeout_ms: 10000
+      description: "Order count and avg value by gender"
+      sql: >-
+        SELECT customer_gender, count(*), avg(taxful_total_price)
+        FROM "opensearch_dashboards_sample_data_ecommerce"
+        GROUP BY customer_gender
+
+    - name: "pc-06-revenue-by-day"
+      type: "sql"
+      template: ""
+      index: ""
+      timeout_ms: 10000
+      description: "Order count and revenue by day of week"
+      sql: >-
+        SELECT day_of_week, count(*), sum(taxful_total_price)
+        FROM "opensearch_dashboards_sample_data_ecommerce"
+        GROUP BY day_of_week ORDER BY sum(taxful_total_price) DESC
+
+    # --- logs: basic-search ---
+    - name: "lg-01-errors"
+      type: "sql"
+      template: ""
+      index: ""
+      timeout_ms: 10000
+      description: "Most recent HTTP 5xx errors"
+      sql: >-
+        SELECT timestamp, clientip, request, response, bytes
+        FROM "opensearch_dashboards_sample_data_logs"
+        WHERE response >= '500' ORDER BY timestamp DESC LIMIT 25
+
+    - name: "lg-02-not-found"
+      type: "sql"
+      template: ""
+      index: ""
+      timeout_ms: 10000
+      description: "Most recent HTTP 404 responses"
+      sql: >-
+        SELECT timestamp, clientip, request, bytes
+        FROM "opensearch_dashboards_sample_data_logs"
+        WHERE response = '404' ORDER BY timestamp DESC LIMIT 25
+
+    - name: "lg-03-large-responses"
+      type: "sql"
+      template: ""
+      index: ""
+      timeout_ms: 10000
+      description: "Responses larger than 10 KB"
+      sql: >-
+        SELECT timestamp, clientip, request, response, bytes
+        FROM "opensearch_dashboards_sample_data_logs"
+        WHERE bytes > 10000 ORDER BY bytes DESC LIMIT 25
+
+    - name: "lg-04-by-host"
+      type: "sql"
+      template: ""
+      index: ""
+      timeout_ms: 10000
+      description: "All requests to a specific host"
+      sql: >-
+        SELECT timestamp, clientip, request, response, bytes
+        FROM "opensearch_dashboards_sample_data_logs"
+        WHERE host = 'cdn.elastic-elastic-elastic.org' ORDER BY timestamp DESC LIMIT 25
+
+    # --- logs: aggregations ---
+    - name: "lg-05-response-code-dist"
+      type: "sql"
+      template: ""
+      index: ""
+      timeout_ms: 10000
+      description: "Request count by HTTP response code"
+      sql: >-
+        SELECT response, count(*) as cnt
+        FROM "opensearch_dashboards_sample_data_logs"
+        GROUP BY response ORDER BY cnt DESC
+
+    - name: "lg-06-top-client-ips"
+      type: "sql"
+      template: ""
+      index: ""
+      timeout_ms: 10000
+      description: "Top 10 client IPs by request count"
+      sql: >-
+        SELECT clientip, count(*) as cnt
+        FROM "opensearch_dashboards_sample_data_logs"
+        GROUP BY clientip ORDER BY cnt DESC LIMIT 10
+
+    - name: "lg-07-bytes-by-host"
+      type: "sql"
+      template: ""
+      index: ""
+      timeout_ms: 10000
+      description: "Total and average bytes transferred per host"
+      sql: >-
+        SELECT host, count(*) as requests, sum(bytes) as total_bytes, avg(bytes) as avg_bytes
+        FROM "opensearch_dashboards_sample_data_logs"
+        GROUP BY host ORDER BY total_bytes DESC
+
+    - name: "lg-08-os-breakdown"
+      type: "sql"
+      template: ""
+      index: ""
+      timeout_ms: 10000
+      description: "Request count by client OS"
+      sql: >-
+        SELECT "machine.os", count(*) as cnt
+        FROM "opensearch_dashboards_sample_data_logs"
+        GROUP BY "machine.os" ORDER BY cnt DESC
+
+    - name: "lg-09-geo-dest"
+      type: "sql"
+      template: ""
+      index: ""
+      timeout_ms: 10000
+      description: "Top destination countries by request count"
+      sql: >-
+        SELECT "geo.dest", count(*) as cnt
+        FROM "opensearch_dashboards_sample_data_logs"
+        GROUP BY "geo.dest" ORDER BY cnt DESC LIMIT 20
+
+    - name: "lg-10-error-rate-by-host"
+      type: "sql"
+      template: ""
+      index: ""
+      timeout_ms: 10000
+      description: "HTTP error rate per host"
+      sql: >-
+        SELECT host,
+               count(*) as total,
+               count(CASE WHEN response >= '400' THEN 1 END) as errors
+        FROM "opensearch_dashboards_sample_data_logs"
+        GROUP BY host ORDER BY errors DESC
+
+    # --- time-series (histogram-style aggregations) ---
+    - name: "ts-01-count-by-currency"
+      type: "sql"
+      template: ""
+      index: ""
+      timeout_ms: 10000
+      description: "Order count grouped by currency"
+      sql: >-
+        SELECT currency, count(*)
+        FROM "opensearch_dashboards_sample_data_ecommerce"
+        GROUP BY currency
+
+    - name: "ts-02-avg-value-by-day"
+      type: "sql"
+      template: ""
+      index: ""
+      timeout_ms: 10000
+      description: "Average order value and count by day of week"
+      sql: >-
+        SELECT day_of_week, avg(taxful_total_price), count(*)
+        FROM "opensearch_dashboards_sample_data_ecommerce"
+        GROUP BY day_of_week ORDER BY avg(taxful_total_price) DESC
+
+    - name: "ts-03-top-countries"
+      type: "sql"
+      template: ""
+      index: ""
+      timeout_ms: 10000
+      description: "Top 20 customer countries by order count and avg value"
+      sql: >-
+        SELECT customer_country, count(*), avg(taxful_total_price)
+        FROM "opensearch_dashboards_sample_data_ecommerce"
+        GROUP BY customer_country ORDER BY count(*) DESC LIMIT 20
+
+# Session mode (dashboard page-load simulation).
+# Uncomment to enable: each tick fires all categories concurrently.
+#
+# query_session:
+#   think_time_ms: 2000
+#   categories:
+#     - name: "alert_view"
+#       iteration: Sequential
+#       parallelism: 1
+#       queries:
+#         - name: "alert_search"
+#           type: "sql"
+#           weight: 1.0
+#           template: ""
+#           index: ""
+#           timeout_ms: 10000
+#           sql_file: "alert_search.sql"
+#     - name: "summary_widgets"
+#       iteration: WeightedRandom
+#       parallelism: 2
+#       queries:
+#         - name: "top_sources_agg"
+#           type: "sql"
+#           weight: 0.6
+#           template: ""
+#           index: ""
+#           timeout_ms: 15000
+#           sql_file: "top_sources_agg.sql"
+#         - name: "incident_timeline"
+#           type: "sql"
+#           weight: 0.4
+#           template: ""
+#           index: ""
+#           timeout_ms: 20000
+#           sql_file: "incident_timeline.sql"
+
+timeline:
+  phases:
+    - name: "warmup"
+      display_name: "Warm-up"
+      duration_seconds: 60
+      query:
+        target_qps: 2.0
+      description: >
+        Low-rate warm-up phase. JIT caches and connection pools stabilise.
+        Results from this phase are excluded from scorecard calculations.
+
+    - name: "baseline"
+      display_name: "Baseline"
+      duration_seconds: 180
+      query:
+        target_qps: 5.0
+      description: >
+        Steady-state query load at nominal concurrency.
+        P99 measured here becomes the baseline for degradation ratios.
+
+    - name: "stress"
+      display_name: "Stress"
+      duration_seconds: 240
+      query:
+        target_qps: 10.0
+      description: >
+        Double the baseline QPS. Measures latency degradation under load
+        and whether the gateway / warehouse sustain throughput.
+
+    - name: "recovery"
+      display_name: "Recovery"
+      duration_seconds: 120
+      query:
+        target_qps: 5.0
+      description: >
+        QPS drops back to baseline. Verifies the system returns to nominal
+        latency after the stress phase.
+
+valid_run_criteria:
+  rules:
+    - name: "baseline_p99_under_5s"
+      condition: "baseline_p99_ms < 5000"
+      message: "Baseline P99 must be under 5 s — system too slow for this benchmark"
+
+    - name: "degradation_ratio"
+      condition: "p99_degradation_ratio < 3.0"
+      message: "Stress-phase P99 must not exceed 3x baseline"
+
+report:
+  title: "Mach5 Query Benchmark Report"
+  emphasis:
+    - "p99_degradation_ratio"
+    - "recovery_time"

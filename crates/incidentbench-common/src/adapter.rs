@@ -48,11 +48,15 @@ pub struct PrepareResult {
 }
 
 /// Result of executing a single query.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct QueryResult {
     pub hit_count: u64,
     pub error: Option<String>,
     pub duration_ms: f64,
+    /// True when the query exceeded the configured timeout.
+    pub timed_out: bool,
+    /// For SQL queries: actual rows returned (vs total matched for search queries).
+    pub row_count: Option<u64>,
 }
 
 /// Target platform adapter configuration.

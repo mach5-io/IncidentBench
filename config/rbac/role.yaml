@@ -58,6 +58,11 @@ rules:
     resources: ["pods/log"]
     verbs: ["get", "list"]
 
+  # PersistentVolumeClaims — results storage for aggregator
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
   # Events — emit Kubernetes events for operator lifecycle transitions
   - apiGroups: [""]
     resources: ["events"]

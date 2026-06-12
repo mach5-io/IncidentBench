@@ -34,7 +34,9 @@ fn json_value_schema(_gen: &mut schemars::r#gen::SchemaGenerator) -> schemars::s
 pub struct Scenario {
     pub scenario: ScenarioMeta,
     /// Data streams — each stream maps to one index, one Kafka topic, and one ingest pipeline.
-    pub data_streams: Vec<DataStream>,
+    /// Absent or empty → no ingest workers, no Kafka setup, no ingest pipeline.
+    #[serde(default)]
+    pub data_streams: Option<Vec<DataStream>>,
     pub query_mix: QueryMix,
     /// Optional analyst groups with per-group query weight distributions.
     #[serde(default)]
@@ -44,6 +46,13 @@ pub struct Scenario {
     pub valid_run_criteria: ValidRunCriteria,
     #[serde(default)]
     pub report: ReportConfig,
+    /// Global query timeout. Used by SQL queries and as a fallback for query_session categories.
+    #[serde(default = "default_timeout_ms")]
+    pub default_timeout_ms: u64,
+    /// Optional session-based execution mode for dashboard page-load simulation.
+    /// When present, workers run session loops instead of the rate-controlled query loop.
+    #[serde(default)]
+    pub query_session: Option<QuerySession>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -146,6 +155,43 @@ pub struct DataGeneratorConfig {
     pub config: serde_json::Value,
 }
 
+// --- Query Session (optional dashboard page-load simulation) ---
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum IterationMode {
+    #[default]
+    Sequential, // round-robin through queries in order
+    WeightedRandom, // existing behaviour
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct QuerySession {
+    pub categories: Vec<QueryCategory>,
+    /// Pause between session ticks in ms; 0 = loop as fast as possible.
+    #[serde(default)]
+    pub think_time_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct QueryCategory {
+    pub name: String,
+    pub queries: Vec<QueryDef>,
+    #[serde(default)]
+    pub iteration: IterationMode,
+    /// Queries fired simultaneously from this category per tick; default 1.
+    #[serde(default = "default_parallelism")]
+    pub parallelism: usize,
+}
+
+fn default_parallelism() -> usize {
+    1
+}
+
+fn default_timeout_ms() -> u64 {
+    10_000
+}
+
 // --- Query Mix ---
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -169,7 +215,6 @@ pub struct QueryDef {
     pub name: String,
     #[serde(rename = "type")]
     pub query_type: String,
-    pub weight: f64,
     pub template: String,
     /// Which index this query targets (must match a data_stream's schema.index_name).
     pub index: String,
@@ -179,6 +224,20 @@ pub struct QueryDef {
     pub limit: Option<u32>,
     #[serde(default)]
     pub timeout_ms: u64,
+    /// Inline SQL text. Takes priority over sql_file when both are set.
+    /// Used with query_type = "sql".
+    #[serde(default)]
+    pub sql: Option<String>,
+    /// Path to a SQL file mounted at /queries/ inside the worker pod.
+    /// Resolved by the operator from sql_dir; slash-separated path is flattened
+    /// to {category}_{filename} in the ConfigMap key.
+    #[serde(default)]
+    pub sql_file: Option<String>,
+    /// Category name for session mode. When all queries in query_mix carry a
+    /// non-None category the operator automatically groups them into a
+    /// QuerySession (round-robin per category, join_all across categories).
+    #[serde(default)]
+    pub category: Option<String>,
     #[serde(default)]
     pub description: String,
     #[serde(default)]
@@ -202,6 +261,7 @@ pub struct PhaseDef {
     pub name: String,
     pub display_name: String,
     pub duration_seconds: u64,
+    #[serde(default)]
     pub query: QueryConfig,
     #[serde(default)]
     pub description: String,
@@ -220,9 +280,19 @@ fn default_batch_size() -> u32 {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct QueryConfig {
+    #[serde(default)]
     pub target_qps: f64,
     #[serde(default)]
     pub mix_override: Option<HashMap<String, f64>>,
+}
+
+impl Default for QueryConfig {
+    fn default() -> Self {
+        Self {
+            target_qps: 0.0,
+            mix_override: None,
+        }
+    }
 }
 
 // --- Valid Run Criteria ---
@@ -275,14 +345,31 @@ pub struct WorkerPhaseRate {
 // --- Validation ---
 
 impl Scenario {
+    /// Returns true when this scenario has ingest work (data_streams present and non-empty).
+    /// All conditional branches for Kafka, ingest pipelines, and ingest workers gate on this.
+    pub fn has_ingest(&self) -> bool {
+        self.data_streams.as_ref().map_or(false, |s| !s.is_empty())
+    }
+
+    /// Returns true when workers should run the session loop (join_all per category,
+    /// sequential round-robin within each category) rather than the rate-controlled
+    /// weighted-random loop.
+    ///
+    /// Two ways to activate session mode:
+    ///   1. Explicit: `query_session` is present in the scenario YAML.
+    ///   2. Auto-detect: every query in `query_mix` has a non-None `category` field.
+    ///      The operator groups them by category and builds a QuerySession automatically.
+    pub fn is_session_mode(&self) -> bool {
+        if self.query_session.is_some() {
+            return true;
+        }
+        !self.query_mix.queries.is_empty()
+            && self.query_mix.queries.iter().all(|q| q.category.is_some())
+    }
+
     /// Validate the scenario structure. Returns a list of errors.
     pub fn validate(&self) -> Vec<String> {
         let mut errors = Vec::new();
-
-        // Validate data streams.
-        if self.data_streams.is_empty() {
-            errors.push("data_streams must have at least one stream".to_string());
-        }
 
         let phase_names: Vec<&str> = self
             .timeline
@@ -291,53 +378,60 @@ impl Scenario {
             .map(|p| p.name.as_str())
             .collect();
 
-        let mut seen_stream_names = std::collections::HashSet::new();
         let mut seen_index_names = std::collections::HashSet::new();
 
-        for stream in &self.data_streams {
-            if !seen_stream_names.insert(&stream.name) {
-                errors.push(format!("Duplicate data stream name: '{}'", stream.name));
-            }
-            if !seen_index_names.insert(&stream.schema.index_name) {
-                errors.push(format!(
-                    "Duplicate index_name: '{}'",
-                    stream.schema.index_name
-                ));
+        // Validate data streams only when present.
+        if let Some(streams) = &self.data_streams {
+            if streams.is_empty() {
+                errors.push("data_streams must have at least one stream if specified".to_string());
             }
 
-            if stream.schema.fields.is_empty() {
-                errors.push(format!(
-                    "Stream '{}': schema must have at least one field",
-                    stream.name
-                ));
-            }
+            let mut seen_stream_names = std::collections::HashSet::new();
 
-            let has_ts = stream
-                .schema
-                .fields
-                .iter()
-                .any(|f| f.name == stream.schema.timestamp_field);
-            if !has_ts {
-                errors.push(format!(
-                    "Stream '{}': timestamp field '{}' not found in schema fields",
-                    stream.name, stream.schema.timestamp_field
-                ));
-            }
-
-            if stream.ingest_replicas == 0 {
-                errors.push(format!(
-                    "Stream '{}': ingest_replicas must be >= 1",
-                    stream.name
-                ));
-            }
-
-            // Every phase in the timeline must have an entry in the stream's ingest map.
-            for phase_name in &phase_names {
-                if !stream.ingest.contains_key(*phase_name) {
+            for stream in streams {
+                if !seen_stream_names.insert(&stream.name) {
+                    errors.push(format!("Duplicate data stream name: '{}'", stream.name));
+                }
+                if !seen_index_names.insert(&stream.schema.index_name) {
                     errors.push(format!(
-                        "Stream '{}': missing ingest config for phase '{}'",
-                        stream.name, phase_name
+                        "Duplicate index_name: '{}'",
+                        stream.schema.index_name
                     ));
+                }
+
+                if stream.schema.fields.is_empty() {
+                    errors.push(format!(
+                        "Stream '{}': schema must have at least one field",
+                        stream.name
+                    ));
+                }
+
+                let has_ts = stream
+                    .schema
+                    .fields
+                    .iter()
+                    .any(|f| f.name == stream.schema.timestamp_field);
+                if !has_ts {
+                    errors.push(format!(
+                        "Stream '{}': timestamp field '{}' not found in schema fields",
+                        stream.name, stream.schema.timestamp_field
+                    ));
+                }
+
+                if stream.ingest_replicas == 0 {
+                    errors.push(format!(
+                        "Stream '{}': ingest_replicas must be >= 1",
+                        stream.name
+                    ));
+                }
+
+                for phase_name in &phase_names {
+                    if !stream.ingest.contains_key(*phase_name) {
+                        errors.push(format!(
+                            "Stream '{}': missing ingest config for phase '{}'",
+                            stream.name, phase_name
+                        ));
+                    }
                 }
             }
         }
@@ -346,21 +440,23 @@ impl Scenario {
             errors.push("Timeline must have at least one phase".to_string());
         }
 
-        // Validate standard 6-phase structure.
-        let expected_phases = [
-            "baseline",
-            "incident_trigger",
-            "ingestion_surge",
-            "overlap",
-            "recovery",
-            "post_incident",
-        ];
-        let actual_phases: Vec<&str> = phase_names.clone();
-        if actual_phases != expected_phases {
-            errors.push(format!(
-                "Timeline must have exactly these phases in order: {:?}, got: {:?}",
-                expected_phases, actual_phases
-            ));
+        // 6-phase name enforcement only applies when ingest is present.
+        if self.has_ingest() {
+            let expected_phases = [
+                "baseline",
+                "incident_trigger",
+                "ingestion_surge",
+                "overlap",
+                "recovery",
+                "post_incident",
+            ];
+            let actual_phases: Vec<&str> = phase_names.clone();
+            if actual_phases != expected_phases {
+                errors.push(format!(
+                    "Timeline must have exactly these phases in order: {:?}, got: {:?}",
+                    expected_phases, actual_phases
+                ));
+            }
         }
 
         // Validate minimum phase duration.
@@ -373,22 +469,15 @@ impl Scenario {
             }
         }
 
-        // Validate query weights sum to ~1.0.
-        let weight_sum: f64 = self.query_mix.queries.iter().map(|q| q.weight).sum();
-        if (weight_sum - 1.0).abs() > 0.01 {
-            errors.push(format!(
-                "Query weights must sum to 1.0, got {:.3}",
-                weight_sum
-            ));
-        }
-
-        // Validate query index references.
-        for query in &self.query_mix.queries {
-            if !seen_index_names.contains(&query.index) {
-                errors.push(format!(
-                    "Query '{}' references unknown index '{}'. Valid indexes: {:?}",
-                    query.name, query.index, seen_index_names
-                ));
+        // Validate query index references only when indexes are known (ingest present).
+        if self.has_ingest() {
+            for query in &self.query_mix.queries {
+                if !seen_index_names.contains(&query.index) {
+                    errors.push(format!(
+                        "Query '{}' references unknown index '{}'. Valid indexes: {:?}",
+                        query.name, query.index, seen_index_names
+                    ));
+                }
             }
         }
 
@@ -460,6 +549,8 @@ impl Scenario {
     /// Compute total events at target rates across all streams.
     pub fn total_events_at_target(&self) -> u64 {
         self.data_streams
+            .as_deref()
+            .unwrap_or(&[])
             .iter()
             .map(|stream| {
                 self.timeline
@@ -479,7 +570,12 @@ impl Scenario {
 
     /// Total ingest replicas across all streams.
     pub fn total_ingest_replicas(&self) -> u32 {
-        self.data_streams.iter().map(|s| s.ingest_replicas).sum()
+        self.data_streams
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .map(|s| s.ingest_replicas)
+            .sum()
     }
 
     /// Apply duration and rate scaling. Returns a new Scenario with scaled values.
@@ -491,9 +587,11 @@ impl Scenario {
             phase.duration_seconds = phase.duration_seconds.max(1);
             phase.query.target_qps *= rate_scale;
         }
-        for stream in &mut scaled.data_streams {
-            for ingest in stream.ingest.values_mut() {
-                ingest.target_eps = ((ingest.target_eps as f64) * rate_scale).round() as u64;
+        if let Some(streams) = &mut scaled.data_streams {
+            for stream in streams {
+                for ingest in stream.ingest.values_mut() {
+                    ingest.target_eps = ((ingest.target_eps as f64) * rate_scale).round() as u64;
+                }
             }
         }
         scaled
@@ -508,13 +606,8 @@ impl Scenario {
                     .query_mix
                     .queries
                     .iter()
-                    .filter_map(|q| {
-                        overrides.get(&q.name).map(|&w| {
-                            let mut q = q.clone();
-                            q.weight = w;
-                            q
-                        })
-                    })
+                    .filter(|q| overrides.contains_key(&q.name))
+                    .cloned()
                     .collect();
                 QueryMix { queries }
             }
@@ -745,17 +838,19 @@ mod tests {
                 description: String::new(),
                 domain: "sre".to_string(),
             },
-            data_streams: vec![stream],
+            data_streams: Some(vec![stream]),
             query_mix: QueryMix {
                 queries: vec![QueryDef {
                     name: "error_search".to_string(),
                     query_type: "search".to_string(),
-                    weight: 1.0,
                     template: "level:ERROR".to_string(),
                     index: "test-logs".to_string(),
                     sort: None,
                     limit: None,
                     timeout_ms: 10000,
+                    sql: None,
+                    sql_file: None,
+                    category: None,
                     description: String::new(),
                     variables: HashMap::new(),
                 }],
@@ -764,6 +859,8 @@ mod tests {
             timeline: Timeline { phases },
             valid_run_criteria: ValidRunCriteria::default(),
             report: ReportConfig::default(),
+            default_timeout_ms: 10_000,
+            query_session: None,
         }
     }
 
@@ -777,11 +874,11 @@ mod tests {
     #[test]
     fn test_scenario_validates_empty_streams() {
         let mut scenario = make_test_scenario();
-        scenario.data_streams.clear();
+        scenario.data_streams = Some(vec![]);
         let errors = scenario.validate();
         assert!(errors
             .iter()
-            .any(|e| e.contains("data_streams must have at least one stream")));
+            .any(|e| e.contains("data_streams must have at least one stream if specified")));
     }
 
     #[test]
@@ -795,8 +892,8 @@ mod tests {
     #[test]
     fn test_ingest_rate_table_divides_evenly() {
         let scenario = make_test_scenario();
-        let stream = &scenario.data_streams[0];
-        let table = scenario.compute_ingest_rate_table(stream, 0);
+        let stream = scenario.data_streams.as_ref().unwrap()[0].clone();
+        let table = scenario.compute_ingest_rate_table(&stream, 0);
         // 100 EPS / 2 replicas = 50 per worker
         let baseline = table
             .phases
@@ -810,14 +907,14 @@ mod tests {
     fn test_ingest_rate_table_remainder_to_last_worker() {
         let mut scenario = make_test_scenario();
         // 101 EPS / 2 replicas = 50 + 1 for last worker
-        scenario.data_streams[0]
+        scenario.data_streams.as_mut().unwrap()[0]
             .ingest
             .get_mut("baseline")
             .unwrap()
             .target_eps = 101;
-        let stream = &scenario.data_streams[0];
-        let table0 = scenario.compute_ingest_rate_table(stream, 0);
-        let table1 = scenario.compute_ingest_rate_table(stream, 1);
+        let stream = scenario.data_streams.as_ref().unwrap()[0].clone();
+        let table0 = scenario.compute_ingest_rate_table(&stream, 0);
+        let table1 = scenario.compute_ingest_rate_table(&stream, 1);
         let w0_baseline = table0
             .phases
             .iter()
@@ -835,10 +932,10 @@ mod tests {
     #[test]
     fn test_ingest_rate_table_zero_replicas_no_panic() {
         let mut scenario = make_test_scenario();
-        scenario.data_streams[0].ingest_replicas = 0;
-        let stream = &scenario.data_streams[0];
+        scenario.data_streams.as_mut().unwrap()[0].ingest_replicas = 0;
+        let stream = scenario.data_streams.as_ref().unwrap()[0].clone();
         // Should not panic — the .max(1) guard handles this.
-        let table = scenario.compute_ingest_rate_table(stream, 0);
+        let table = scenario.compute_ingest_rate_table(&stream, 0);
         let baseline = table
             .phases
             .iter()
@@ -891,7 +988,10 @@ mod tests {
             .unwrap();
         assert_eq!(baseline.duration_seconds, 60); // 30 * 2.0
         assert_eq!(baseline.query.target_qps, 5.0); // 10.0 * 0.5
-        let stream_baseline = scaled.data_streams[0].ingest.get("baseline").unwrap();
+        let stream_baseline = scaled.data_streams.as_ref().unwrap()[0]
+            .ingest
+            .get("baseline")
+            .unwrap();
         assert_eq!(stream_baseline.target_eps, 50); // 100 * 0.5
     }
 }

@@ -19,7 +19,7 @@ REPORTER_IMG  := $(REGISTRY)/reporter:$(VERSION)
 
 KIND_CLUSTER  ?= incidentbench
 KIND_VERSION  ?= v1.30.0
-STRIMZI_VERSION ?= 0.43.0
+STRIMZI_VERSION ?= 0.45.0
 
 CRD_OUTPUT    := config/crd/incidentbenchrun-crd.yaml
 NAMESPACE     := incidentbench-system
@@ -95,12 +95,16 @@ deploy-local: ## Create kind cluster, load images, install CRD and operator, dep
 	$(MAKE) generate-crd
 	$(MAKE) install-crd
 	@echo ""
-	@echo "=== Deploying Strimzi Kafka operator ==="
-	kubectl create namespace kafka 2>/dev/null || true
-	kubectl create -f "https://strimzi.io/install/$(STRIMZI_VERSION)?namespace=kafka" -n kafka 2>/dev/null || \
-		kubectl replace -f "https://strimzi.io/install/$(STRIMZI_VERSION)?namespace=kafka" -n kafka
-	@echo "Waiting for Strimzi operator to be ready..."
-	kubectl wait --for=condition=Available deployment/strimzi-cluster-operator -n kafka --timeout=120s
+	@echo "=== Deploying Strimzi Kafka operator (skip with SKIP_STRIMZI=1 for query-only runs) ==="
+	@if [ "$(SKIP_STRIMZI)" != "1" ]; then \
+		kubectl create namespace kafka 2>/dev/null || true; \
+		STRIMZI_URL="https://github.com/strimzi/strimzi-kafka-operator/releases/download/$(STRIMZI_VERSION)/strimzi-$(STRIMZI_VERSION).yaml"; \
+		kubectl create -f "$$STRIMZI_URL" -n kafka 2>/dev/null || kubectl replace -f "$$STRIMZI_URL" -n kafka; \
+		echo "Waiting for Strimzi operator to be ready..."; \
+		kubectl wait --for=condition=Available deployment/strimzi-cluster-operator -n kafka --timeout=120s; \
+	else \
+		echo "Skipping Strimzi (SKIP_STRIMZI=1)"; \
+	fi
 	@echo ""
 	@echo "=== Creating operator namespace and RBAC ==="
 	$(MAKE) deploy

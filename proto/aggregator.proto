@@ -69,6 +69,7 @@ message AggregatedSnapshot {
   // Worker counts.
   int32 ingest_workers_reporting = 40;
   int32 query_workers_reporting = 41;
+  int32 concurrent_sessions = 42;
 
   // Harness health.
   bool harness_saturated = 50;
@@ -97,6 +98,18 @@ message GetLatestSnapshotRequest {}
 
 message GetResultsRequest {}
 
+// Per-query latency summary accumulated across all workers for the full run.
+message QueryLatencySummary {
+  string query_name = 1;
+  double p50 = 2;
+  double p95 = 3;
+  double p99 = 4;
+  double max = 5;
+  int64 count = 6;
+  int64 error_count = 7;
+  int64 timeout_count = 8;
+}
+
 message GetResultsResponse {
   bool valid = 1;
   repeated string validity_violations = 2;
@@ -110,4 +123,8 @@ message GetResultsResponse {
   uint64 peak_backlog = 14;
   double backlog_drain_time_s = 15;
   double recovery_time_s = 16;
+  // Session-mode timed-out query log (empty for rate-controlled benchmarks).
+  repeated incidentbench.worker.TimedOutQueryRecord timed_out_queries = 20;
+  // Per-query latency breakdown across the full run.
+  repeated QueryLatencySummary per_query_latency = 21;
 }

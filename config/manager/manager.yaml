@@ -45,7 +45,7 @@ spec:
       containers:
         - name: operator
           image: OPERATOR_IMAGE_PLACEHOLDER
-          imagePullPolicy: Always
+          imagePullPolicy: IfNotPresent
           env:
             - name: RUST_LOG
               value: "info,incidentbench_operator=debug"

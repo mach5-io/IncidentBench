@@ -30,6 +30,9 @@ prost-types = { workspace = true }
 # Kafka
 rdkafka = { workspace = true }
 
+# PostgreSQL (for sql query type via Mach5 gateway)
+tokio-postgres = { workspace = true }
+
 # Metrics
 tdigest = { workspace = true }
 
