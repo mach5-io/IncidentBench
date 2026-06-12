@@ -1104,6 +1104,7 @@ async fn handle_cleanup(
         "aggregator",
         "query",
         "prepare",
+        "sql-files",
     ] {
         let cm_name = format!("{}-{}", name, suffix);
         match cm_api.delete(&cm_name, &Default::default()).await {

@@ -293,9 +293,14 @@ pub async fn run(config_path: &str) -> anyhow::Result<()> {
                     .or_default()
                     .push(qr.duration_ms);
                 *per_type_executed.entry(query.name.clone()).or_default() += 1;
-                if qr.error.is_some() {
+                if qr.error.is_some() || qr.timed_out {
                     query_errors += 1;
                     *per_type_errors.entry(query.name.clone()).or_default() += 1;
+                    let message = qr.error.as_deref().unwrap_or(if qr.timed_out {
+                        "query timed out"
+                    } else {
+                        "query failed"
+                    });
                     pending_error_records.push(query_error_record(
                         query,
                         query.category.as_deref().unwrap_or(""),
@@ -304,7 +309,7 @@ pub async fn run(config_path: &str) -> anyhow::Result<()> {
                         effective_index,
                         qr.duration_ms,
                         qr.timed_out,
-                        qr.error.as_deref().unwrap_or("query failed"),
+                        message,
                     ));
                 }
             }
