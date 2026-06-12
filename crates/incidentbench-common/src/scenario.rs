@@ -348,7 +348,7 @@ impl Scenario {
     /// Returns true when this scenario has ingest work (data_streams present and non-empty).
     /// All conditional branches for Kafka, ingest pipelines, and ingest workers gate on this.
     pub fn has_ingest(&self) -> bool {
-        self.data_streams.as_ref().map_or(false, |s| !s.is_empty())
+        self.data_streams.as_ref().is_some_and(|s| !s.is_empty())
     }
 
     /// Returns true when workers should run the session loop (join_all per category,

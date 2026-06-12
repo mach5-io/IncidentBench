@@ -691,6 +691,7 @@ pub async fn run(config_path: &str, listen_addr: &str) -> anyhow::Result<()> {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
     use incidentbench_common::metrics::PercentileSummary;
@@ -820,6 +821,7 @@ fn build_per_query_timeseries_points(
 }
 
 /// Write metrics.json, timed_out_queries.json, and per_query_latency.json on run completion.
+#[allow(clippy::type_complexity)]
 async fn persist_results(
     results_path: &str,
     timeline: &[AggregatedMetricPoint],
@@ -835,7 +837,7 @@ async fn persist_results(
 
     let timeseries = TimeSeries {
         resolution_s: 1,
-        points: timeline.iter().map(|p| p.clone()).collect(),
+        points: timeline.to_vec(),
     };
     match serde_json::to_string_pretty(&timeseries) {
         Ok(json) => {

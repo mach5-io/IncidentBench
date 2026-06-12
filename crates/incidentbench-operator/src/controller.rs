@@ -824,7 +824,7 @@ async fn handle_aggregating(
 
     // Connect to the aggregator gRPC service.
     let channel = match tonic::transport::Channel::from_shared(format!("http://{}", agg_addr))
-        .and_then(|ch| Ok(ch.connect_timeout(Duration::from_secs(5))))
+        .map(|ch| ch.connect_timeout(Duration::from_secs(5)))
     {
         Ok(ch) => match ch.connect().await {
             Ok(c) => c,

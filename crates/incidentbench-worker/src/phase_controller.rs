@@ -368,7 +368,7 @@ pub async fn run(config_path: &str, listen_addr: &str) -> anyhow::Result<()> {
                 )),
             };
 
-            for (_, (_, tx)) in &workers {
+            for (_, tx) in workers.values() {
                 let _ = tx.send(prepare_msg.clone()).await;
             }
 
@@ -389,7 +389,7 @@ pub async fn run(config_path: &str, listen_addr: &str) -> anyhow::Result<()> {
             s.workers.clone()
         };
 
-        for (_wid, (mode, tx)) in &workers {
+        for (mode, tx) in workers.values() {
             let rate = match mode.as_str() {
                 "ingest" => phase.per_worker_ingest_eps as i64,
                 "query" => phase.per_worker_query_mqps as i64,
@@ -428,7 +428,7 @@ pub async fn run(config_path: &str, listen_addr: &str) -> anyhow::Result<()> {
             payload: Some(controller_message::Payload::RunComplete(RunComplete {})),
         };
 
-        for (_, (_, tx)) in &s.workers {
+        for (_, tx) in s.workers.values() {
             let _ = tx.send(complete_msg.clone()).await;
         }
     }

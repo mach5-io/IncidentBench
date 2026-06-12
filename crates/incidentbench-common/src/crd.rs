@@ -275,18 +275,10 @@ pub struct ResourceSpec {
     pub limits: Option<HashMap<String, String>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct ResultsSpec {
     #[serde(default)]
     pub storage: ResultsStorageSpec,
-}
-
-impl Default for ResultsSpec {
-    fn default() -> Self {
-        Self {
-            storage: ResultsStorageSpec::default(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]

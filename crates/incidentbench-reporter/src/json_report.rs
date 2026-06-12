@@ -17,6 +17,7 @@ use incidentbench_common::scenario::Scenario;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
+#[allow(clippy::too_many_arguments)]
 pub fn generate(
     scenario: &Scenario,
     timeseries: &TimeSeries,
@@ -214,10 +215,9 @@ pub fn build_per_category_latency(
         }
     }
 
-    let mut category_rollups: std::collections::BTreeMap<
-        String,
-        (f64, f64, f64, f64, f64, u64, u64),
-    > = std::collections::BTreeMap::new(); // category -> (p50_sum, p95_max, p99_max, min, max, count, errors)
+    type CategoryRollup = (f64, f64, f64, f64, f64, u64, u64);
+    let mut category_rollups: std::collections::BTreeMap<String, CategoryRollup> =
+        std::collections::BTreeMap::new(); // category -> (p50_sum, p95_max, p99_max, min, max, count, errors)
 
     for query in &scenario.query_mix.queries {
         let Some(category) = &query.category else {
@@ -545,14 +545,15 @@ fn evaluate_criteria_rule(
     };
 
     // "violated" means the condition is NOT met.
-    match operator {
-        "<" => !(actual < threshold),
-        "<=" => !(actual <= threshold),
-        ">" => !(actual > threshold),
-        ">=" => !(actual >= threshold),
-        "==" => !((actual - threshold).abs() < f64::EPSILON),
-        _ => false,
-    }
+    let condition_met = match operator {
+        "<" => actual < threshold,
+        "<=" => actual <= threshold,
+        ">" => actual > threshold,
+        ">=" => actual >= threshold,
+        "==" => (actual - threshold).abs() < f64::EPSILON,
+        _ => return false,
+    };
+    !condition_met
 }
 
 fn mean_of(iter: impl Iterator<Item = f64>) -> f64 {

@@ -19,6 +19,7 @@ use kube::{Api, Client};
 use std::collections::HashMap;
 
 /// Execute the `run` command — create an IncidentBenchRun CR.
+#[allow(clippy::too_many_arguments)]
 pub async fn execute(
     scenario_path: &str,
     target: &str,

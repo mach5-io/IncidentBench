@@ -86,11 +86,7 @@ impl DataGenerator {
         let worker_seed = derive_worker_seed(run_seed, worker_index);
         let rng = StdRng::seed_from_u64(worker_seed);
 
-        let field_generators = schema
-            .fields
-            .iter()
-            .map(|f| build_field_generator(f))
-            .collect();
+        let field_generators = schema.fields.iter().map(build_field_generator).collect();
 
         Self {
             rng,
