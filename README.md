@@ -239,25 +239,24 @@ The query-only harness measures query performance against a pre-loaded dataset w
 
 ### Step 1 — Apply the run manifest
 
-For a local kind cluster targeting the microk8s Mach5 dev cluster:
+Start from the query-only example and fill in the target settings for your Mach5 deployment:
 
 ```bash
-kubectl apply -f config/samples/kind-query-test.yaml
+cp config/samples/query-only-mach5.example.yaml /tmp/query-only-mach5.yaml
+# Edit spec.target.config.endpoint, pg_host, pg_port, pg_user, pg_password,
+# and warehouse.name for your environment.
+kubectl apply -f /tmp/query-only-mach5.yaml
 ```
 
-For a production Mach5 cluster:
+For a larger benchmark, use:
 
 ```bash
-kubectl apply -f config/samples/mach5-query-bench-run.yaml
+cp config/samples/mach5-query-bench-run.yaml /tmp/mach5-query-bench-run.yaml
+# Edit the same spec.target.config fields before applying.
+kubectl apply -f /tmp/mach5-query-bench-run.yaml
 ```
 
-The run manifests contain all SQL queries inline — no ConfigMaps or external files are needed.
-
-> **Note:** Before applying `kind-query-test.yaml` or `mach5-query-bench-run.yaml`, verify the `endpoint` and `pg_host` fields match your Mach5 node IP:
-> ```bash
-> kubectl get node <node-name> -o wide   # check INTERNAL-IP
-> ```
-> Then update `spec.target.config.endpoint` and `spec.target.config.pg_host` in the file.
+The run manifests contain all SQL queries inline — no ConfigMaps or external files are needed. The sample queries assume the public OpenSearch Dashboards sample datasets are already loaded; adjust table names and SQL for your own dataset.
 
 ### Step 2 — Watch until Completed
 
@@ -309,13 +308,18 @@ incidentbench report get <run-name> \
   --output ./results/
 ```
 
-This copies three files to `./results/`:
+This copies the report artifacts to `./results/`:
 
 | File | Contents |
 |---|---|
 | `report.html` | Interactive HTML report: per-phase latency, per-query P50/P95/P99, scorecard |
 | `run.json` | Full structured result including all metrics and validity assessment |
 | `timeseries.csv` | Per-second QPS and latency timeseries for import into other tools |
+| `timed_out_queries.json` | Timed-out query details, when captured |
+| `query_error_samples.json` | Sampled query error diagnostics, when captured |
+| `per_query_latency.json` | Per-query latency summary |
+| `per_query_timeseries.json` | Per-query latency timeseries |
+| `per_category_latency.json` | Per-category latency summary for session-mode workloads |
 
 ### Step 4 — Open the report
 
@@ -344,13 +348,13 @@ kubectl apply -f config/samples/<manifest>.yaml
 
 Examples:
 ```bash
-# kind query test
-kubectl delete ibrun kind-query-test-001 -n incidentbench-system
-kubectl apply -f config/samples/kind-query-test.yaml
+# query-only example
+kubectl delete ibrun query-only-mach5-example -n incidentbench-system
+kubectl apply -f /tmp/query-only-mach5.yaml
 
 # mach5 query benchmark
 kubectl delete ibrun mach5-qb-run-001 -n incidentbench-system
-kubectl apply -f config/samples/mach5-query-bench-run.yaml
+kubectl apply -f /tmp/mach5-query-bench-run.yaml
 ```
 
 ### Cleaning up
