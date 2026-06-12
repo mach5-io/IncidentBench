@@ -48,6 +48,21 @@ message TimedOutQueryRecord {
   int64  timeout_ms   = 6;
 }
 
+// A sampled non-successful query execution. This is diagnostic detail; the
+// authoritative totals remain in query_errors and query_latency_by_type.errors.
+message QueryErrorRecord {
+  string query_name   = 1;
+  string category     = 2;
+  string phase        = 3;
+  string worker_id    = 4;
+  int32  worker_index = 5;
+  int64  timestamp_ms = 6;
+  double duration_ms  = 7;
+  bool   timed_out    = 8;
+  string error_class  = 9;
+  string message      = 10;
+}
+
 // Per-second metric snapshot from a single worker.
 message WorkerMetricSnapshot {
   // Worker identity
@@ -87,4 +102,6 @@ message WorkerMetricSnapshot {
 
   // Timed-out queries from this worker (session mode only; empty for rate-controlled workers).
   repeated TimedOutQueryRecord timed_out_queries = 16;
+  // Sampled query errors from this worker for diagnostics.
+  repeated QueryErrorRecord query_error_records = 17;
 }

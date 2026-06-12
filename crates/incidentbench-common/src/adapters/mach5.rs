@@ -246,7 +246,7 @@ impl Mach5Adapter {
                 ..Default::default()
             }),
             Ok(Err(e)) => Ok(QueryResult {
-                error: Some(e.to_string()),
+                error: Some(format_postgres_error(&e)),
                 duration_ms,
                 ..Default::default()
             }),
@@ -270,6 +270,28 @@ impl Mach5Adapter {
                 })
             }
         }
+    }
+}
+
+fn format_postgres_error(e: &tokio_postgres::Error) -> String {
+    if let Some(db_error) = e.as_db_error() {
+        let mut parts = vec![
+            format!("severity={}", db_error.severity()),
+            format!("code={}", db_error.code().code()),
+            format!("message={}", db_error.message()),
+        ];
+        if let Some(detail) = db_error.detail() {
+            parts.push(format!("detail={}", detail));
+        }
+        if let Some(hint) = db_error.hint() {
+            parts.push(format!("hint={}", hint));
+        }
+        if let Some(position) = db_error.position() {
+            parts.push(format!("position={:?}", position));
+        }
+        parts.join("; ")
+    } else {
+        format!("{} ({:?})", e, e)
     }
 }
 

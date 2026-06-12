@@ -23,7 +23,9 @@ use incidentbench_common::proto::aggregator::{
     GetLatestSnapshotRequest, GetResultsRequest, GetResultsResponse, ReportMetricsResponse,
     StreamMetricsRequest,
 };
-use incidentbench_common::proto::worker::{TimedOutQueryRecord, WorkerMetricSnapshot};
+use incidentbench_common::proto::worker::{
+    QueryErrorRecord, TimedOutQueryRecord, WorkerMetricSnapshot,
+};
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{BaseConsumer, Consumer};
 use rdkafka::topic_partition_list::TopicPartitionList;
@@ -32,7 +34,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{broadcast, Mutex};
 use tonic::{transport::Server, Request, Response, Status, Streaming};
-use tracing::{error, info};
+use tracing::{error, info, warn};
+
+const MAX_QUERY_ERROR_RECORDS: usize = 1000;
 
 /// Configuration for a single data stream's lag polling.
 #[derive(Debug, Clone, Deserialize)]
@@ -80,6 +84,8 @@ struct AggregatorState {
     state: AggState,
     /// Accumulated timed-out query records from all session workers.
     timed_out_queries: Vec<TimedOutQueryRecord>,
+    /// Sampled query error records from all query workers.
+    query_error_records: Vec<QueryErrorRecord>,
     /// Per-query latency accumulator: query_name → (latency_values, error_count, timeout_count).
     per_query_latency: HashMap<String, PerQueryAccumulator>,
     /// Per-query latency timeline derived from 1-second buckets.
@@ -121,12 +127,69 @@ impl MetricsAggregatorService {
                 total_snapshots: 0,
                 state: AggState::Collecting,
                 timed_out_queries: Vec::new(),
+                query_error_records: Vec::new(),
                 per_query_latency: HashMap::new(),
                 per_query_timeseries: HashMap::new(),
                 results_path,
             })),
             live_tx,
         }
+    }
+}
+
+fn complete_aggregation(s: &mut AggregatorState, reason: &str) {
+    if s.state == AggState::Complete {
+        return;
+    }
+
+    info!(
+        reason,
+        connected_workers = s.connected_workers,
+        total_snapshots = s.total_snapshots,
+        seconds_aggregated = s.timeline.len(),
+        "Transitioning aggregation to Complete"
+    );
+    s.state = AggState::Complete;
+
+    if !s.results_path.is_empty() {
+        let path = s.results_path.clone();
+        let timeouts = s.timed_out_queries.clone();
+        let query_errors = s.query_error_records.clone();
+        let per_query = s
+            .per_query_latency
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.clone(),
+                    (v.latencies.clone(), v.error_count, v.timeout_count),
+                )
+            })
+            .collect::<Vec<_>>();
+        let per_query_timeseries = s
+            .per_query_timeseries
+            .iter()
+            .map(|(query_name, points)| PerQueryTimeSeries {
+                query_name: query_name.clone(),
+                points: {
+                    let mut points = points.clone();
+                    points.sort_by_key(|p| p.timestamp_s);
+                    points
+                },
+            })
+            .collect::<Vec<_>>();
+        let mut timeline = s.timeline.clone();
+        timeline.sort_by_key(|p| p.timestamp_s);
+        tokio::spawn(async move {
+            persist_results(
+                &path,
+                &timeline,
+                &timeouts,
+                &query_errors,
+                &per_query,
+                &per_query_timeseries,
+            )
+            .await;
+        });
     }
 }
 
@@ -154,6 +217,7 @@ impl MetricsService for MetricsAggregatorService {
 
             // Extract timeout records and per-query latency before snapshot moves into bucket.
             let timeout_records: Vec<_> = snapshot.timed_out_queries.clone();
+            let query_error_records: Vec<_> = snapshot.query_error_records.clone();
 
             // Accumulate per-query latency from query_latency_by_type.
             for qt in &snapshot.query_latency_by_type {
@@ -207,6 +271,13 @@ impl MetricsService for MetricsAggregatorService {
             if !timeout_records.is_empty() {
                 s.timed_out_queries.extend(timeout_records);
             }
+            if !query_error_records.is_empty()
+                && s.query_error_records.len() < MAX_QUERY_ERROR_RECORDS
+            {
+                let remaining = MAX_QUERY_ERROR_RECORDS - s.query_error_records.len();
+                s.query_error_records
+                    .extend(query_error_records.into_iter().take(remaining));
+            }
 
             // Try to aggregate this bucket if it has enough data.
             // (In practice, we'd wait for the watermark. Simplified here.)
@@ -243,51 +314,7 @@ impl MetricsService for MetricsAggregatorService {
             let mut s = state.lock().await;
             s.connected_workers = s.connected_workers.saturating_sub(1);
             if s.connected_workers == 0 && s.had_workers {
-                info!(
-                    total_snapshots = s.total_snapshots,
-                    seconds_aggregated = s.timeline.len(),
-                    "All workers disconnected, transitioning to Complete"
-                );
-                s.state = AggState::Complete;
-                if !s.results_path.is_empty() {
-                    let path = s.results_path.clone();
-                    let timeline = s.timeline.clone();
-                    let timeouts = s.timed_out_queries.clone();
-                    let per_query = s
-                        .per_query_latency
-                        .iter()
-                        .map(|(k, v)| {
-                            (
-                                k.clone(),
-                                (v.latencies.clone(), v.error_count, v.timeout_count),
-                            )
-                        })
-                        .collect::<Vec<_>>();
-                    let per_query_timeseries = s
-                        .per_query_timeseries
-                        .iter()
-                        .map(|(query_name, points)| PerQueryTimeSeries {
-                            query_name: query_name.clone(),
-                            points: {
-                                let mut points = points.clone();
-                                points.sort_by_key(|p| p.timestamp_s);
-                                points
-                            },
-                        })
-                        .collect::<Vec<_>>();
-                    let mut timeline = timeline;
-                    timeline.sort_by_key(|p| p.timestamp_s);
-                    tokio::spawn(async move {
-                        persist_results(
-                            &path,
-                            &timeline,
-                            &timeouts,
-                            &per_query,
-                            &per_query_timeseries,
-                        )
-                        .await;
-                    });
-                }
+                complete_aggregation(&mut s, "all workers disconnected");
             }
         }
 
@@ -365,12 +392,22 @@ impl MetricsService for MetricsAggregatorService {
         &self,
         _request: Request<GetResultsRequest>,
     ) -> Result<Response<GetResultsResponse>, Status> {
-        let s = self.state.lock().await;
+        let mut s = self.state.lock().await;
 
         if s.state != AggState::Complete {
-            return Err(Status::failed_precondition(
-                "Aggregation not yet complete; call GetAggregationStatus to check state",
-            ));
+            if s.had_workers && s.total_snapshots > 0 {
+                warn!(
+                    connected_workers = s.connected_workers,
+                    total_snapshots = s.total_snapshots,
+                    seconds_aggregated = s.timeline.len(),
+                    "GetResults requested before all worker streams closed; force-completing aggregation with collected snapshots"
+                );
+                complete_aggregation(&mut s, "forced by GetResults");
+            } else {
+                return Err(Status::failed_precondition(
+                    "Aggregation not yet complete; call GetAggregationStatus to check state",
+                ));
+            }
         }
 
         let timeseries = TimeSeries {
@@ -653,6 +690,53 @@ pub async fn run(config_path: &str, listen_addr: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use incidentbench_common::metrics::PercentileSummary;
+
+    #[tokio::test]
+    async fn get_results_force_completes_with_collected_snapshots() {
+        let service = MetricsAggregatorService::new(String::new());
+
+        {
+            let mut state = service.state.lock().await;
+            state.had_workers = true;
+            state.connected_workers = 1;
+            state.total_snapshots = 1;
+            state.timeline.push(AggregatedMetricPoint {
+                timestamp_s: 1,
+                phase: "baseline".to_string(),
+                ingest_events_produced: 0,
+                ingest_events_acknowledged: 0,
+                ingest_events_failed: 0,
+                ingest_target_eps: 0,
+                ingest_kafka_produce_latency: PercentileSummary::default(),
+                query_executed: 1,
+                query_errors: 0,
+                query_target_qps: 1.0,
+                query_latency: PercentileSummary::default(),
+                kafka_consumer_lag: 0,
+                ingest_workers_reporting: 0,
+                query_workers_reporting: 1,
+                concurrent_sessions: 0,
+                harness_saturated: false,
+                max_worker_cpu: 0.0,
+                query_group_metrics: HashMap::new(),
+            });
+        }
+
+        service
+            .get_results(Request::new(GetResultsRequest {}))
+            .await
+            .expect("GetResults should force-complete when snapshots exist");
+
+        let state = service.state.lock().await;
+        assert_eq!(state.state, AggState::Complete);
+        assert_eq!(state.connected_workers, 1);
+    }
+}
+
 /// Compute percentile summaries from the per-query accumulator map.
 fn compute_per_query_summaries(
     acc: &HashMap<String, PerQueryAccumulator>,
@@ -740,6 +824,7 @@ async fn persist_results(
     results_path: &str,
     timeline: &[AggregatedMetricPoint],
     timed_out_queries: &[TimedOutQueryRecord],
+    query_error_records: &[QueryErrorRecord],
     per_query: &[(String, (Vec<f64>, u64, u64))],
     per_query_timeseries: &[PerQueryTimeSeries],
 ) {
@@ -799,6 +884,51 @@ async fn persist_results(
             }
         }
         Err(e) => error!("Failed to serialize timed_out_queries: {}", e),
+    }
+
+    // Serialize sampled query error details as plain JSON for diagnostics.
+    #[derive(serde::Serialize)]
+    struct QueryErrorSample<'a> {
+        query_name: &'a str,
+        category: &'a str,
+        phase: &'a str,
+        worker_id: &'a str,
+        worker_index: i32,
+        timestamp_ms: i64,
+        duration_ms: f64,
+        timed_out: bool,
+        error_class: &'a str,
+        message: &'a str,
+    }
+    let error_samples: Vec<QueryErrorSample<'_>> = query_error_records
+        .iter()
+        .map(|r| QueryErrorSample {
+            query_name: &r.query_name,
+            category: &r.category,
+            phase: &r.phase,
+            worker_id: &r.worker_id,
+            worker_index: r.worker_index,
+            timestamp_ms: r.timestamp_ms,
+            duration_ms: r.duration_ms,
+            timed_out: r.timed_out,
+            error_class: &r.error_class,
+            message: &r.message,
+        })
+        .collect();
+    match serde_json::to_string_pretty(&error_samples) {
+        Ok(json) => {
+            let path = format!("{}/query_error_samples.json", results_path);
+            if let Err(e) = tokio::fs::write(&path, json).await {
+                error!(path, "Failed to write query_error_samples.json: {}", e);
+            } else {
+                info!(
+                    path,
+                    count = error_samples.len(),
+                    "query_error_samples.json written"
+                );
+            }
+        }
+        Err(e) => error!("Failed to serialize query_error_samples: {}", e),
     }
 
     // Serialize per-query latency summary for the reporter.

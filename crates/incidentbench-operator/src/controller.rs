@@ -857,8 +857,11 @@ async fn handle_aggregating(
     };
 
     if status_resp.state != "complete" {
-        // Timeout: if no workers connected and no snapshots after 120s in Aggregating,
-        // proceed with empty results rather than waiting forever.
+        // Aggregating starts only after the phase controller reports timeline completion
+        // and the operator scales workers down. If the aggregator still reports
+        // "collecting" after a grace period, at least one worker stream is stale or
+        // failed to close cleanly; proceed with the snapshots collected so finalizers
+        // and reporting cannot hang indefinitely.
         let aggregating_since = run
             .metadata
             .annotations
@@ -868,12 +871,16 @@ async fn handle_aggregating(
             .map(|dt| chrono::Utc::now().signed_duration_since(dt).num_seconds())
             .unwrap_or(0);
 
-        let aggregating_too_long = status_resp.connected_workers == 0
-            && status_resp.snapshots_received == 0
-            && aggregating_since > 120;
+        let aggregating_too_long = aggregating_since > 120;
 
         if aggregating_too_long {
-            warn!(name = %name, "Aggregation timeout: no workers connected after 120s, completing with empty results");
+            warn!(
+                name = %name,
+                connected_workers = status_resp.connected_workers,
+                snapshots = status_resp.snapshots_received,
+                aggregating_since,
+                "Aggregation timeout after timeline completion; forcing result collection from available snapshots"
+            );
         } else {
             info!(
                 name = %name,
